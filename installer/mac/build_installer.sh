@@ -19,7 +19,9 @@ make_component () {   # <id> <bundle path> <install dir> [scripts dir]
     pkgbuild --analyze --root "$root" "$WORK/$id.plist"
     local n; n=$(/usr/libexec/PlistBuddy -c "Print" "$WORK/$id.plist" | grep -c "RootRelativeBundlePath" || true)
     for ((i = 0; i < n; i++)); do
-        /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$WORK/$id.plist"
+        # the key is not always present in the generated plist: set it, or add it when it isn't there
+        /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$WORK/$id.plist" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$WORK/$id.plist"
     done
     local args=(--root "$root" --component-plist "$WORK/$id.plist" --identifier "com.perception.chupaloops.$id"
                 --version "$VERSION" --install-location "$dest")
