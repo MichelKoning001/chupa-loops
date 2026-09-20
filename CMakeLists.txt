@@ -112,6 +112,10 @@ target_sources(ChupaLoops PRIVATE ${CHUPALOOPS_SOURCES})
 target_include_directories(ChupaLoops PRIVATE Source)
 
 target_compile_definitions(ChupaLoops PUBLIC
+    # Signalsmith pulls in Apple's Accelerate (and with it Carbon's Point/Component) on macOS.
+    # JUCE's global "using namespace juce" would make those names ambiguous, so we keep it off
+    # and qualify juce names ourselves.
+    DONT_SET_USING_JUCE_NAMESPACE=1
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
@@ -154,7 +158,7 @@ if(SLICETRIBE_BUILD_TESTS)
     juce_generate_juce_header(RenderTest)
     target_sources(RenderTest PRIVATE tests/RenderTest.cpp Source/SliceEngine.cpp)
     target_include_directories(RenderTest PRIVATE Source)
-    target_compile_definitions(RenderTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_compile_definitions(RenderTest PRIVATE DONT_SET_USING_JUCE_NAMESPACE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     if(MSVC)
         target_compile_options(RenderTest PRIVATE /bigobj)
     endif()
@@ -166,7 +170,7 @@ if(SLICETRIBE_BUILD_TESTS)
     juce_generate_juce_header(UITest)
     target_sources(UITest PRIVATE tests/UITest.cpp ${CHUPALOOPS_SOURCES})
     target_include_directories(UITest PRIVATE Source)
-    target_compile_definitions(UITest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_MP3AUDIOFORMAT=1
+    target_compile_definitions(UITest PRIVATE DONT_SET_USING_JUCE_NAMESPACE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_MP3AUDIOFORMAT=1
         JucePlugin_VersionString="${PROJECT_VERSION}" CHUPALOOPS_BUILD_NUMBER=${SLICETRIBE_BUILD_NUMBER}
         JUCE_USE_XRANDR=0 JUCE_USE_XINERAMA=0 JUCE_USE_XCURSOR=0 JUCE_ALSA=0 JUCE_JACK=0)
     target_link_libraries(UITest PRIVATE SliceTribeData juce::juce_audio_utils juce::juce_audio_processors signalsmith-stretch

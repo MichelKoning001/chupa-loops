@@ -559,7 +559,8 @@ void DragNumber::showEditor()
     editor->setBounds (getLocalBounds());
     addAndMakeVisible (*editor);
     editor->grabKeyboardFocus();
-    auto commit = [this] (bool apply)
+    const juce::Component::SafePointer<DragNumber> safeThis (this);   // made here: MSVC misreads "this" in a nested lambda
+    auto commit = [this, safeThis] (bool apply)
     {
         if (editor == nullptr) return;
         if (apply)
@@ -572,9 +573,9 @@ void DragNumber::showEditor()
                 if (onDragEnd) onDragEnd (value);
             }
         }
-        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<DragNumber> (this)]
+        juce::MessageManager::callAsync ([safeThis]
         {
-            if (safe != nullptr) { safe->editor.reset(); safe->repaint(); }
+            if (safeThis != nullptr) { safeThis->editor.reset(); safeThis->repaint(); }
         });
     };
     editor->onReturnKey = [commit] { commit (true); };
@@ -1252,15 +1253,16 @@ void SceneButton::mouseUp (const juce::MouseEvent& e)
         return;
     const juce::String letter = juce::String::charToString ((juce::juce_wchar) ('A' + index));
     const bool used = proc.isSceneUsed (index);
-    auto store = [this, letter]
+    auto store = [safe = juce::Component::SafePointer<SceneButton> (this), letter]
     {
-        if (! proc.hasLoop())
+        if (safe == nullptr) return;
+        if (! safe->proc.hasLoop())
         {
-            if (onMessage) onMessage ("Make a loop first, then store it as scene " + letter);
+            if (safe->onMessage) safe->onMessage ("Make a loop first, then store it as scene " + letter);
             return;
         }
-        proc.storeScene (index);
-        if (onMessage) onMessage ("Scene " + letter + " stored - click it to come back to this loop");
+        safe->proc.storeScene (safe->index);
+        if (safe->onMessage) safe->onMessage ("Scene " + letter + " stored - click it to come back to this loop");
     };
 
     if (e.mods.isPopupMenu() || e.mods.isShiftDown())

@@ -714,10 +714,10 @@ void drawByline (juce::Graphics& g, const Skin& s, Rectangle<float> area)
     const auto tf = res->inter[0];
     const auto f = tf != nullptr ? juce::Font (juce::FontOptions (tf).withHeight (11.0f))
                                  : juce::Font (juce::FontOptions (11.0f));
-    g.setColour ((s.sticker ? s.stickerLine : Colours::black).withAlpha (0.35f));
+    g.setColour ((s.sticker ? s.stickerLine : juce::Colours::black).withAlpha (0.35f));
     g.setFont (f);
     g.drawText ("By Alexander Koning", area.translated (0.0f, 1.0f), juce::Justification::centredLeft, false);
-    g.setColour (Colours::white.withAlpha (0.85f));
+    g.setColour (juce::Colours::white.withAlpha (0.85f));
     g.drawText ("By Alexander Koning", area, juce::Justification::centredLeft, false);
 }
 
