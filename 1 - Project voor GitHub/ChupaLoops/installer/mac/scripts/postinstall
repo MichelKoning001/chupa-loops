@@ -1,0 +1,4 @@
+#!/bin/bash
+# make hosts see the new Audio Unit right away
+killall -9 AudioComponentRegistrar 2>/dev/null || true
+exit 0

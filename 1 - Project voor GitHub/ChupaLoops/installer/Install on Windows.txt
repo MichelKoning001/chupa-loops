@@ -1,0 +1,14 @@
+CHUPA LOOPS - Windows (manual install)
+
+Easiest: run ChupaLoops-Windows-Setup.exe from the Releases page instead. This zip is for installing by hand.
+
+1. Copy the folder "Chupa Loops.vst3" to:
+   C:\Program Files\Common Files\VST3\
+
+2. Restart your DAW (Fender Studio Pro, Cubase, Ableton Live, FL Studio, Bitwig, Reaper ...)
+   and rescan plug-ins if needed. Chupa Loops is listed under instruments (Percep-tion > Chupa Loops).
+
+3. "Chupa Loops.exe" is the standalone app: double-click to run it without a DAW.
+   Space bar = play/stop, N = new loop. Set your audio device via "Options" in the window.
+
+If Windows SmartScreen warns about the app: click "More info" > "Run anyway".
