@@ -20,6 +20,8 @@ struct SlotInfo
     juce::String name, path;
     double detectedBpm = 0, bpmOverride = 0;
     int transpose = 0;
+    float weight = 1.0f;
+    bool reference = false;
     double stretchRatio = 1.0;
     std::vector<float> peaks;
 };
@@ -81,6 +83,13 @@ public:
     void loadSlot (int slot, const juce::File&);
     void clearSlot (int slot);
     void setSlotEnabled (int slot, bool);
+    void setSlotWeight (int slot, float weight);       // 0..2: share of the slices coming from this sample
+    /** FIT TO TRACK: mark a slot as "my track". It is not sliced; the new loop leaves room for it. */
+    void setSlotReference (int slot, bool isReference);
+    int  getReferenceSlot() const noexcept { return referenceSlot.load(); }
+    /** Listen to one sample on its own (at its own tempo), looping. -1 = stop. */
+    void setSlotPreview (int slot);
+    int  getSlotPreview() const noexcept { return slotPreviewIndex.load(); }
     void setSlotBpm (int slot, double bpmOrZeroForAuto);
     void setSlotTranspose (int slot, int semitones);
     int  getSlotsVersion() const noexcept { return slotsVersion.load(); }
@@ -89,6 +98,16 @@ public:
     void generateNew (const ParamMap* settingsBefore = nullptr);
     void crazyLoop (int flavour);   // the skin's "craziest loop ever" (flavour = skin index)
     void mutate();                  // a variation: 20-30% of the unlocked slices change
+    void rerollRhythm();            // new rhythm, same sources
+    void rerollSources();           // same rhythm, other slices
+    void autoPick (int candidates = 8);   // makes a few loops and keeps the one that scores best
+    int  keepToScene();             // stores the loop in the first free scene, -1 = all full
+    juce::File exportStems (const juce::File& parentFolder);   // one WAV per sample (asks the worker)
+    /** Message from a background job (stems, auto pick) for the UI, and a version that changes with it. */
+    juce::String getJobMessage() const;
+    int  getJobVersion() const noexcept { return jobVersion.load(); }
+    bool isJobBusy() const noexcept { return jobBusy.load(); }
+    bool jobFailed() const noexcept { return jobError.load(); }
 
     // scenes A-H: favourite loops (arrangement + settings) to recall live
     static constexpr int numScenes = 8;
@@ -222,6 +241,25 @@ private:
                       abortWork { false }, upToDate { false }, previewRestart { false },
                       prepareInterrupt { false };
     std::atomic<int> lockedCount { 0 };
+    // FIT TO TRACK: read on the audio thread too, so lock-free
+    std::atomic<int> referenceSlot { -1 };
+    std::atomic<float> fitAmount { 0.0f };
+    std::array<std::atomic<float>, 16> fitProfile {};
+    std::atomic<int> fitVersion { 0 };     // seqlock: odd while being written
+    std::atomic<int> pendingReferenceKey { -1 };   // slot whose key still has to be applied after loading
+    std::atomic<int> keyBeforeReference { -1 };
+    void updateFitFromSlots();
+    void applyReferenceKey (int slot);
+    // background jobs on the worker thread (they need the prepared samples)
+    std::atomic<int> autoPickRequest { 0 }, jobVersion { 0 };
+    std::atomic<bool> stemsRequest { false }, jobBusy { false }, jobError { false };
+    juce::File stemsFolder;
+    mutable juce::CriticalSection jobLock;
+    juce::String jobMessage;
+    ParamMap beforeCrazy, afterCrazy;     // guarded by jobLock
+    std::atomic<bool> crazyActive { false };
+    void runAutoPick (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate, int candidates);
+    void runStems (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate);
     std::atomic<double> hostBpm { 140.0 }, fallbackBpm { 140.0 }, currentRate { 0.0 }, playPosition { -1.0 };
 
     // result hand-off
@@ -259,6 +297,18 @@ private:
     int lastMode = 0;
     FxChain fx;
     std::array<int, 64> fxSliceStarts {};
+
+    // listening to a single slot (its own tempo, looping): published by the message thread
+    void mixSlotPreview (juce::AudioBuffer<float>&, double rate);
+    mutable juce::SpinLock slotPreviewLock;
+    std::shared_ptr<const juce::AudioBuffer<float>> slotPreviewAudio;   // guarded by slotPreviewLock
+    std::atomic<double> slotPreviewRate { 44100.0 };
+    std::deque<std::shared_ptr<const juce::AudioBuffer<float>>> slotPreviewKeep;   // message thread: keeps old audio alive
+    std::atomic<int> slotPreviewIndex { -1 }, slotPreviewVersion { 0 };
+    std::shared_ptr<const juce::AudioBuffer<float>> slotPlaying;        // audio thread
+    double slotPlayPos = 0.0, slotPlayStep = 1.0;
+    float slotPlayGain = 0.0f;
+    int slotPlayVersion = -1;
 
     juce::Array<juce::AudioProcessorParameter*> allParams;
     std::array<std::atomic<int>, 128> ccMap;              // CC number → index in allParams (-1 = none)

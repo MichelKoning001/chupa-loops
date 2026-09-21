@@ -160,7 +160,7 @@ if(SLICETRIBE_BUILD_TESTS)
     target_include_directories(RenderTest PRIVATE Source)
     target_compile_definitions(RenderTest PRIVATE DONT_SET_USING_JUCE_NAMESPACE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     if(MSVC)
-        target_compile_options(RenderTest PRIVATE /bigobj)
+        target_compile_options(RenderTest PRIVATE /bigobj /utf-8)
     endif()
     target_link_libraries(RenderTest PRIVATE
         juce::juce_audio_formats juce::juce_audio_basics signalsmith-stretch
@@ -170,6 +170,9 @@ if(SLICETRIBE_BUILD_TESTS)
     juce_generate_juce_header(UITest)
     target_sources(UITest PRIVATE tests/UITest.cpp ${CHUPALOOPS_SOURCES})
     target_include_directories(UITest PRIVATE Source)
+    if(MSVC)
+        target_compile_options(UITest PRIVATE /bigobj /utf-8)
+    endif()
     target_compile_definitions(UITest PRIVATE DONT_SET_USING_JUCE_NAMESPACE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_MP3AUDIOFORMAT=1
         JucePlugin_VersionString="${PROJECT_VERSION}" CHUPALOOPS_BUILD_NUMBER=${SLICETRIBE_BUILD_NUMBER}
         JUCE_USE_XRANDR=0 JUCE_USE_XINERAMA=0 JUCE_USE_XCURSOR=0 JUCE_ALSA=0 JUCE_JACK=0)

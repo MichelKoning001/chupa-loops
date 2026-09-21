@@ -173,6 +173,7 @@ class SlotComponent : public juce::Component,
 public:
     SlotComponent (SliceTribeProcessor&, int index);
     void refresh (const SlotInfo&);
+    void setPreviewing (bool);
 
     void paint (juce::Graphics&) override;
     void paintOverChildren (juce::Graphics&) override;
@@ -195,10 +196,10 @@ private:
     SliceTribeProcessor& proc;
     int index;
     SlotInfo info;
-    bool dragOver = false;
+    bool dragOver = false, previewing = false;
 
-    DragNumber bpmField, transposeField;
-    juce::TextButton powerButton, clearButton;
+    DragNumber bpmField, transposeField, weightField;
+    juce::TextButton powerButton, clearButton, playButton;
     std::unique_ptr<juce::FileChooser> chooser;
 };
 

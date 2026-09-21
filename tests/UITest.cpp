@@ -226,6 +226,7 @@ int main (int argc, char** argv)
 
     // ---- presets
     {
+        setParam ("fxDrive", 60);   // the finishing layer stays while you browse presets
         CHECK (factoryPresets().size() == 101, "101 factory presets (Init + 100)");
         juce::StringArray names;
         for (auto& p : factoryPresets()) names.addIfNotAlreadyThere (p.name);
@@ -244,6 +245,12 @@ int main (int argc, char** argv)
             if (proc->presets.isModified()) allOk = false;
         }
         CHECK (allOk, "every factory preset loads exactly (and is not 'modified')");
+        setParam ("fxDrive", 60);
+        proc->presets.loadPreset (7);   // a normal factory preset
+        CHECK (proc->apvts.getRawParameterValue ("fxDrive")->load() > 59.0f && ! proc->presets.isModified(),
+               "a factory preset keeps your FX and is not marked as modified");
+        proc->presets.loadPreset (0);   // Init
+        CHECK (proc->apvts.getRawParameterValue ("fxDrive")->load() < 1.0f, "Init resets the FX");
         proc->presets.loadPreset (7);
         proc->apvts.getParameter ("chaos")->setValueNotifyingHost (0.99f);
         CHECK (proc->presets.isModified(), "changing a knob marks the preset as modified");
@@ -423,6 +430,354 @@ int main (int argc, char** argv)
             return true;
         };
         waitFor (*proc, proc->getResultVersion());
+
+        // share per sample, energy, time feel, partial rerolls, KEEP, AUTO PICK and stems
+        {
+            auto segmentsOfSlot = [] (const RenderResult& r, int slot)
+            {
+                int n = 0;
+                for (const auto& sg : r.segments) n += sg.slot == slot ? 1 : 0;
+                return n;
+            };
+            // share: 0% means no slices from that sample at all
+            auto before = proc->getDisplayResult();
+            int busiest = 0, had = 0;
+            for (int i = 0; i < kNumSlots; ++i)
+                if (const int n = segmentsOfSlot (*before, i); n > had) { had = n; busiest = i; }
+            proc->setSlotWeight (busiest, 0.0f);
+            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "re-render after a share change");
+            auto zero = proc->getDisplayResult();
+            std::cout << "     slot " << (busiest + 1) << " slices: " << had << " at 100%, " << segmentsOfSlot (*zero, busiest) << " at 0%\n";
+            CHECK (had > 0 && segmentsOfSlot (*zero, busiest) == 0, "share 0% = no slices from that sample");
+            CHECK (std::abs (proc->getSlotInfo (busiest).weight) < 0.001f, "the share is in the slot info");
+            {
+                juce::MemoryBlock st2;
+                proc->getStateInformation (st2);
+                auto pw = std::make_unique<SliceTribeProcessor>();
+                pw->setStateInformation (st2.getData(), (int) st2.getSize());
+                const auto t0 = juce::Time::getMillisecondCounter();
+                while (! pw->getSlotInfo (busiest).loaded && juce::Time::getMillisecondCounter() - t0 < 20000)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+                CHECK (pw->getSlotInfo (busiest).weight < 0.001f, "the share is stored with the project");
+            }
+            proc->setSlotWeight (busiest, 1.0f);
+            waitFor (*proc, proc->getResultVersion() + 1);
+
+            // energy: busier towards the end of the loop
+            setParam ("energy", 100);
+            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "re-render after energy");
+            auto en = proc->getDisplayResult();
+            const double half = en->audio.getNumSamples() * 0.5;
+            int early = 0, late = 0;
+            for (const auto& sg : en->segments)
+                (sg.start < half ? early : late) += sg.glitch ? 1 : 0;
+            std::cout << "     energy: " << early << " rolls in the first half, " << late << " in the second\n";
+            CHECK (late > early, "energy makes the second half busier");
+            setParam ("energy", 0);
+            waitFor (*proc, proc->getResultVersion() + 1);
+
+            // time feel: half time uses the samples at half speed
+            auto normal = proc->getDisplayResult();
+            setParam ("feel", 1);
+            CHECK (waitFor (*proc, proc->getResultVersion() + 1, 30000), "re-render in half time");
+            auto halfTime = proc->getDisplayResult();
+            CHECK (halfTime->settings.feel == 1 && halfTime->audio.getNumSamples() == normal->audio.getNumSamples()
+                   && ! same (halfTime.get(), normal.get()), "half time: same length, different sound");
+            setParam ("feel", 0);
+            waitFor (*proc, proc->getResultVersion() + 1, 30000);
+
+            // partial rerolls
+            setParam ("octave", 50); setParam ("reverse", 40);   // enough character to see it change
+            waitFor (*proc, proc->getResultVersion() + 1);
+            auto base = proc->getDisplayResult();
+            proc->rerollRhythm();
+            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "reroll rhythm renders");
+            auto rhy = proc->getDisplayResult();
+            bool sameSources = rhy->segments.size() == base->segments.size();
+            bool otherCharacter = false;
+            for (size_t i = 0; i < juce::jmin (rhy->segments.size(), base->segments.size()); ++i)
+            {
+                // the sample and the spot inside it stay; an octave slice reads from the resampled copy,
+                // so only compare srcStart when the octave flag is the same
+                sameSources &= rhy->segments[i].slot == base->segments[i].slot
+                            && (rhy->segments[i].octave != base->segments[i].octave || rhy->segments[i].srcStart == base->segments[i].srcStart);
+                otherCharacter |= rhy->segments[i].reversed != base->segments[i].reversed
+                                || rhy->segments[i].octave != base->segments[i].octave
+                                || rhy->segments[i].glitch != base->segments[i].glitch
+                                || rhy->segments[i].start != base->segments[i].start;
+            }
+            std::cout << "     RHY: sources kept " << (int) sameSources << ", character changed " << (int) otherCharacter << "\n";
+            CHECK (sameSources && otherCharacter, "RHY keeps the sources and changes the rhythm");
+            auto base2 = proc->getDisplayResult();
+            proc->rerollSources();
+            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "reroll sources renders");
+            auto src = proc->getDisplayResult();
+            bool sameStarts = src->segments.size() == base2->segments.size();
+            bool otherSources = false;
+            for (size_t i = 0; i < juce::jmin (src->segments.size(), base2->segments.size()); ++i)
+            {
+                sameStarts &= src->segments[i].start == base2->segments[i].start;
+                otherSources |= src->segments[i].srcStart != base2->segments[i].srcStart || src->segments[i].slot != base2->segments[i].slot;
+            }
+            CHECK (sameStarts && otherSources, "SRC keeps the rhythm and changes the slices");
+            {
+                // RHY must still do something after SRC (forceOwn used to kill it)
+                auto base3 = proc->getDisplayResult();
+                proc->rerollRhythm();
+                waitFor (*proc, proc->getResultVersion() + 1);
+                auto rhy2 = proc->getDisplayResult();
+                int changed = 0;
+                for (size_t i = 0; i < juce::jmin (rhy2->segments.size(), base3->segments.size()); ++i)
+                    changed += rhy2->segments[i].reversed != base3->segments[i].reversed
+                            || rhy2->segments[i].octave != base3->segments[i].octave
+                            || rhy2->segments[i].glitch != base3->segments[i].glitch ? 1 : 0;
+                std::cout << "     RHY after SRC changed " << changed << " slices\n";
+                CHECK (changed > 0, "RHY still works after SRC");
+            }
+            setParam ("octave", 10); setParam ("reverse", 0);
+            waitFor (*proc, proc->getResultVersion() + 1);
+
+            // locked slices must survive a new rhythm and a new loop
+            {
+                proc->toggleLock (1);
+                waitFor (*proc, proc->getResultVersion() + 1);
+                auto locked = proc->getDisplayResult();
+                int lockedSeg = -1;
+                for (size_t i = 0; i < locked->segments.size(); ++i)
+                    if (locked->segments[i].locked) { lockedSeg = (int) i; break; }
+                proc->rerollRhythm();
+                waitFor (*proc, proc->getResultVersion() + 1);
+                auto after = proc->getDisplayResult();
+                bool kept = lockedSeg >= 0 && lockedSeg < (int) after->segments.size();
+                if (kept)
+                {
+                    const auto& a1 = locked->segments[(size_t) lockedSeg];
+                    const auto& b1 = after->segments[(size_t) lockedSeg];
+                    kept = b1.locked && a1.slot == b1.slot && a1.srcStart == b1.srcStart
+                        && a1.reversed == b1.reversed && a1.octave == b1.octave;
+                }
+                CHECK (kept, "a locked slice stays exactly the same after RHY");
+                proc->generateNew();
+                waitFor (*proc, proc->getResultVersion() + 1);
+                auto after2 = proc->getDisplayResult();
+                bool kept2 = lockedSeg >= 0 && lockedSeg < (int) after2->segments.size()
+                          && after2->segments[(size_t) lockedSeg].locked
+                          && after2->segments[(size_t) lockedSeg].slot == locked->segments[(size_t) lockedSeg].slot
+                          && after2->segments[(size_t) lockedSeg].reversed == locked->segments[(size_t) lockedSeg].reversed
+                          && after2->segments[(size_t) lockedSeg].octave == locked->segments[(size_t) lockedSeg].octave;
+                CHECK (kept2, "a locked slice stays exactly the same after NEW LOOP");
+                proc->unlockAll();
+                waitFor (*proc, proc->getResultVersion() + 1);
+            }
+
+            // FIT TO TRACK
+            {
+                // a reference with a clear 4-to-the-floor pattern: steps 0, 4, 8 and 12 are busy
+                const double rate = 48000.0, refBpm = 140.0;
+                juce::AudioBuffer<float> kicks (2, (int) (rate * 4 * 4 * 60.0 / refBpm));
+                kicks.clear();
+                const double beat = rate * 60.0 / refBpm;
+                for (int b = 0; b < 16; ++b)
+                    for (int i = 0; i < (int) (rate * 0.12); ++i)
+                    {
+                        const int pos = (int) (b * beat) + i;
+                        if (pos >= kicks.getNumSamples()) break;
+                        const double t = i / rate;
+                        const float v = (float) (std::sin (juce::MathConstants<double>::twoPi * 55.0 * t) * std::exp (-t * 14.0) * 0.8);
+                        kicks.setSample (0, pos, v);
+                        kicks.setSample (1, pos, v);
+                    }
+                auto prof = engine::gridProfile (kicks, rate, refBpm);
+                std::cout << "     grid profile: ";
+                for (int i = 0; i < 16; ++i) std::cout << juce::String (prof[(size_t) i], 2) << " ";
+                std::cout << "\n";
+                const float onBeat = juce::jmin (juce::jmin (prof[0], prof[4]), juce::jmin (prof[8], prof[12]));
+                float offBeat = 0.0f;
+                for (int i = 0; i < 16; ++i) if (i % 4 != 0) offBeat = juce::jmax (offBeat, prof[(size_t) i]);
+                CHECK (onBeat > 0.8f && offBeat < 0.4f, "grid profile finds the beats of a 4-to-the-floor track");
+
+                auto refFile = out.getChildFile ("MyTrack_140.wav");
+                engine::writeWav (refFile, kicks, rate, 1.0f);
+                proc->loadSlot (7, refFile);
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                setParam ("pattern", 4);     // Rolling 16th: hits on every step, so fit has something to skip
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                auto withoutFit = proc->getDisplayResult();
+                proc->setSlotReference (7, true);
+                CHECK (waitFor (*proc, proc->getResultVersion() + 1, 30000), "re-render with a reference track");
+                CHECK (proc->getReferenceSlot() == 7 && proc->getSlotInfo (7).reference, "slot 8 is the reference track");
+                auto withFit = proc->getDisplayResult();
+                int fromRef = 0;
+                for (const auto& sg : withFit->segments) fromRef += sg.slot == 7 ? 1 : 0;
+                CHECK (fromRef == 0, "no slices are taken from your own track");
+
+                auto onBeatShare = [] (const RenderResult& r)
+                {
+                    const double step = r.samplesPerBeat() / 4.0;
+                    int on = 0, total = 0;
+                    for (const auto& sg : r.segments)
+                    {
+                        const int st = ((int) std::llround (sg.start / step)) % 16;
+                        ++total;
+                        on += st % 4 == 0 ? 1 : 0;
+                    }
+                    return total > 0 ? (double) on / total : 0.0;
+                };
+                const double before2 = onBeatShare (*withoutFit), after2 = onBeatShare (*withFit);
+                std::cout << "     slices on the beat: " << juce::String (before2 * 100, 0) << "% without fit, "
+                          << juce::String (after2 * 100, 0) << "% with fit (" << withoutFit->segments.size()
+                          << " vs " << withFit->segments.size() << " slices)\n";
+                CHECK (after2 < before2 && withFit->segments.size() < withoutFit->segments.size(),
+                       "FIT TO TRACK leaves room where the track is busy");
+
+                // a sample with no rhythm (a pad) gives no fit grid, so the loop stays full
+                {
+                    juce::AudioBuffer<float> pad (2, (int) (rate * 4 * 4 * 60.0 / refBpm));
+                    for (int i = 0; i < pad.getNumSamples(); ++i)
+                    {
+                        const double t = i / rate;
+                        const float v = (float) (0.25 * (std::sin (juce::MathConstants<double>::twoPi * 110.0 * t)
+                                                       + std::sin (juce::MathConstants<double>::twoPi * 164.8 * t)));
+                        pad.setSample (0, i, v); pad.setSample (1, i, v);
+                    }
+                    auto padProfile = engine::gridProfile (pad, rate, refBpm);
+                    float mx = 0.0f;
+                    for (auto v : padProfile) mx = juce::jmax (mx, v);
+                    CHECK (mx == 0.0f, "an even pad gives no fit grid (nothing to fit around)");
+                    juce::AudioBuffer<float> tooShort (2, (int) (rate * 0.5));
+                    tooShort.clear();
+                    auto shortProfile = engine::gridProfile (tooShort, rate, refBpm);
+                    float mxs = 0.0f;
+                    for (auto v : shortProfile) mxs = juce::jmax (mxs, v);
+                    CHECK (mxs == 0.0f, "a sample shorter than a bar gives no fit grid");
+                }
+
+                proc->setSlotWeight (7, 0.0f);   // fit 0% = as if there were no reference
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                CHECK (onBeatShare (*proc->getDisplayResult()) > after2, "FIT at 0% puts the slices back");
+                proc->setSlotReference (7, false);
+                proc->clearSlot (7);
+                setParam ("pattern", 2);
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                CHECK (proc->getReferenceSlot() == -1, "clearing the slot ends FIT TO TRACK");
+            }
+
+            // the motif repeat must survive SRC
+            {
+                setParam ("motif", 1);      // 1 bar motif
+                setParam ("variation", 0);  // every repeat identical
+                waitFor (*proc, proc->getResultVersion() + 1);
+                auto motifRepeats = [] (const RenderResult& r)
+                {
+                    const double bar = r.samplesPerBeat() * 4.0;
+                    int same = 0, pairs = 0;
+                    for (const auto& a2 : r.segments)
+                        if (a2.start < bar)
+                            for (const auto& b2 : r.segments)
+                                if (std::abs ((double) b2.start - ((double) a2.start + bar)) < 8.0)
+                                {
+                                    ++pairs;
+                                    same += (a2.slot == b2.slot && a2.srcStart == b2.srcStart) ? 1 : 0;
+                                }
+                    return pairs > 0 ? (double) same / pairs : 0.0;
+                };
+                const double before3 = motifRepeats (*proc->getDisplayResult());
+                proc->rerollSources();
+                waitFor (*proc, proc->getResultVersion() + 1);
+                const double after3 = motifRepeats (*proc->getDisplayResult());
+                std::cout << "     motif repeats: " << juce::String (before3 * 100, 0) << "% before SRC, "
+                          << juce::String (after3 * 100, 0) << "% after\n";
+                CHECK (before3 > 0.7 && after3 > 0.7, "SRC keeps the motif repeat");
+                setParam ("motif", 2); setParam ("variation", 20);
+                waitFor (*proc, proc->getResultVersion() + 1);
+            }
+
+            // KEEP
+            for (int i = 0; i < SliceTribeProcessor::numScenes; ++i) proc->clearScene (i);
+            CHECK (proc->keepToScene() == 0 && proc->isSceneUsed (0), "KEEP puts the loop in scene A");
+            CHECK (proc->keepToScene() == 1, "KEEP uses the next free scene");
+            for (int i = 2; i < SliceTribeProcessor::numScenes; ++i) proc->keepToScene();
+            CHECK (proc->keepToScene() == -1, "KEEP says when all scenes are full");
+            for (int i = 0; i < SliceTribeProcessor::numScenes; ++i) proc->clearScene (i);
+
+            // AUTO PICK
+            {
+                const int g = proc->getGenerateCount(), v = proc->getResultVersion(), jv = proc->getJobVersion();
+                proc->autoPick (4);
+                const auto t0 = juce::Time::getMillisecondCounter();
+                while (proc->getJobVersion() == jv && juce::Time::getMillisecondCounter() - t0 < 30000)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+                waitFor (*proc, proc->getResultVersion());
+                std::cout << "     " << proc->getJobMessage() << "\n";
+                auto picked = proc->getDisplayResult();
+                CHECK (proc->getJobVersion() != jv && proc->getGenerateCount() > g && proc->getResultVersion() > v
+                       && picked != nullptr && ! picked->segments.empty(), "AUTO PICK makes a loop");
+                CHECK (engine::scoreLoop (*picked) > 0.0, "the chosen loop scores above zero");
+                juce::AudioBuffer<float> silence (2, 48000);
+                silence.clear();
+                RenderResult empty;
+                empty.audio = std::move (silence);
+                CHECK (engine::scoreLoop (empty) == 0.0, "silence scores zero");
+            }
+
+            // stems
+            {
+                auto stemDir = out.getChildFile ("Stems");
+                stemDir.deleteRecursively();
+                const int jv = proc->getJobVersion();
+                auto folder = proc->exportStems (stemDir);
+                const auto t0 = juce::Time::getMillisecondCounter();
+                while (proc->getJobVersion() == jv && juce::Time::getMillisecondCounter() - t0 < 30000)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+                const int wavs = folder.getNumberOfChildFiles (juce::File::findFiles, "*.wav");
+                std::cout << "     stems: " << wavs << " WAVs in " << folder.getFileName() << "\n";
+                CHECK (wavs >= 2, "stems: one WAV per sample");
+                auto r2 = proc->getDisplayResult();
+                juce::AudioFormatManager fm; fm.registerBasicFormats();
+                juce::AudioBuffer<float> sum;
+                bool ok = true;
+                for (auto& f : folder.findChildFiles (juce::File::findFiles, false, "*.wav"))
+                {
+                    std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (f));
+                    if (rd == nullptr) { ok = false; break; }
+                    juce::AudioBuffer<float> b ((int) rd->numChannels, (int) rd->lengthInSamples);
+                    rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+                    if (sum.getNumSamples() == 0) { sum.setSize (2, b.getNumSamples()); sum.clear(); }
+                    if (b.getNumSamples() != sum.getNumSamples()) { ok = false; break; }
+                    for (int c = 0; c < 2; ++c)
+                        sum.addFrom (c, 0, b, juce::jmin (c, b.getNumChannels() - 1), 0, b.getNumSamples());
+                }
+                double dev = 0.0;
+                if (ok && r2 != nullptr && sum.getNumSamples() == r2->audio.getNumSamples())
+                    for (int i = 0; i < sum.getNumSamples(); i += 5)
+                        dev = juce::jmax (dev, (double) std::abs (sum.getSample (0, i) - r2->audio.getSample (0, i)));
+                else
+                    dev = 1.0;
+                std::cout << "     stems summed vs the loop: max deviation " << dev << "\n";
+                CHECK (dev < 0.06, "the stems together sound like the loop");
+            }
+        }
+
+        // listening to one sample on its own
+        {
+            CHECK (proc->getSlotPreview() == -1, "no sample preview at the start");
+            proc->setSlotPreview (1);
+            CHECK (proc->getSlotPreview() == 1, "slot 2 preview on");
+            float level = 0.0f;
+            for (int k = 0; k < 60; ++k) level = juce::jmax (level, block ({}).getMagnitude (0, 512));
+            std::cout << "     sample preview level: " << level << "\n";
+            CHECK (level > 0.01f, "the sample plays on its own");
+            proc->setSlotPreview (1);          // same slot again = stop
+            CHECK (proc->getSlotPreview() == -1, "clicking again stops it");
+            float tail = 1.0f;
+            for (int k = 0; k < 6; ++k) tail = block ({}).getMagnitude (0, 512);
+            CHECK (tail < 1.0e-5f, "sample preview fades out");
+            proc->setSlotPreview (0);
+            proc->clearSlot (7);               // clearing another slot keeps it playing
+            CHECK (proc->getSlotPreview() == 0, "preview survives a change to another slot");
+            proc->setSlotPreview (-1);
+            for (int k = 0; k < 6; ++k) block ({});
+        }
 
         // mutate: a variation, one more version in the history
         {

@@ -7,7 +7,7 @@ const juce::StringArray& presetParameterIds()
 {
     static const juce::StringArray ids { "pattern", "length", "motif", "sliceMode", "sliceSize", "stretch", "style", "chaos",
                                          "variation", "gate", "swing", "amount", "reverse", "octave", "fade", "sensitivity",
-                                         "fill", "fxCutoff", "fxReso", "fxEnv", "fxDecay", "fxPump", "fxDrive", "fxLowCut", "fxWidth" };
+                                         "fill", "energy", "feel", "fxCutoff", "fxReso", "fxEnv", "fxDecay", "fxPump", "fxDrive", "fxLowCut", "fxWidth" };
     return ids;
 }
 
@@ -112,6 +112,11 @@ juce::StringArray PresetManager::getCategories() const
     return c;
 }
 
+bool PresetManager::isKeptParameter (const juce::String& id)
+{
+    return id.startsWith ("fx") || id == "fill" || id == "feel";   // the finishing layer survives a preset
+}
+
 void PresetManager::apply (const PresetData& p)
 {
     for (auto& id : presetParameterIds())
@@ -121,7 +126,7 @@ void PresetManager::apply (const PresetData& p)
             float plain = param->convertFrom0to1 (param->getDefaultValue());
             if (auto it = p.values.find (id); it != p.values.end())
                 plain = it->second;
-            else if (id.startsWith ("fx") || id == "fill")
+            else if (isKeptParameter (id))
             {
                 // the finishing layer (FX, fill) stays while you browse presets that don't set it; Init resets it
                 if (p.category != "Init")
@@ -148,10 +153,14 @@ void PresetManager::loadPreset (int index, bool fromHost)
         currentIndex = index;
         currentName = p.name;
         currentValues = p.values;
-        for (auto& id : presetParameterIds())   // missing values mean "default"
+        for (auto& id : presetParameterIds())   // missing values mean "default", except the kept ones
             if (currentValues.find (id) == currentValues.end())
-                if (auto* param = apvts.getParameter (id))
+            {
+                if (isKeptParameter (id) && p.category != "Init")
+                    currentValues[id] = apvts.getRawParameterValue (id)->load();     // stays as you had it
+                else if (auto* param = apvts.getParameter (id))
                     currentValues[id] = param->convertFrom0to1 (param->getDefaultValue());
+            }
     }
     apply (p);
     if (onPresetLoaded)

@@ -68,6 +68,7 @@ private:
     void showExportMenu();
     void exportMidiWithDialog();
     void exportKit();
+    void exportStems();
     void updateCharacterTab();
     void flash (const juce::String&, juce::Colour = colours::cyan());
     void showSkinMenu();
@@ -80,8 +81,8 @@ private:
     juce::OwnedArray<SlotComponent> slots;
     ResultView resultView;
 
-    ChoiceSelector patternSel, lengthSel, motifSel, modeSel, sizeSel, styleSel, stretchSel, fillSel, midiModeSel;
-    Knob chaos, variation, gate, swing, amount, reverse, octave, fade, sensitivity, volume;
+    ChoiceSelector patternSel, lengthSel, motifSel, modeSel, sizeSel, styleSel, stretchSel, fillSel, midiModeSel, feelSel;
+    Knob chaos, variation, gate, swing, amount, reverse, octave, fade, sensitivity, energy, volume;
     Knob fxCutoff, fxReso, fxEnv, fxDecay, fxLowCut, fxDrive, fxPump, fxWidth;
     PanelTabs charTabs { { "Character", "FX" } };
     juce::OwnedArray<SceneButton> sceneButtons;
@@ -90,7 +91,7 @@ private:
 
     GenerateButton generateButton;
     CrazyButton crazyButton;
-    juce::TextButton mutateButton, backButton, forwardButton, exportButton, previewButton, unlockButton, spliceButton,
+    juce::TextButton mutateButton, rhythmButton, sourcesButton, autoPickButton, keepButton, backButton, forwardButton, exportButton, previewButton, unlockButton, spliceButton,
                      presetPrev, presetNext, presetSave, skinButton, aboutButton, clearAllButton;
     PresetNameBox presetName;
     DragOutTile dragOut, dragMidi;
@@ -102,7 +103,7 @@ private:
     TourOverlay tour;
 
     int lastSlotsVersion = -1, lastResultVersion = -1, loadedCount = 0, lastSkin = -1,
-        lastLearnVersion = -1, lastMidiEvent = -1, lastGenerate = -1, clearConfirmTicks = 0, learnTicks = 0, lastScenes = -1;
+        lastLearnVersion = -1, lastMidiEvent = -1, lastGenerate = -1, clearConfirmTicks = 0, learnTicks = 0, lastScenes = -1, lastSlotPreview = -2, lastJobVersion = -1;
     bool flashOnNextResult = false;
     float mascotAnim = 0.0f, time = 0.0f;
     juce::String lastPresetText;

@@ -79,6 +79,7 @@ void Arrangement::resizeFor (size_t numHits)
 void Arrangement::regenerate (juce::uint64 newSeed)
 {
     seed = newSeed;
+    rhythmSeed = hashCombine (newSeed, 0x51CEull);
     for (size_t i = 0; i < hitSeeds.size(); ++i)
     {
         if (locked[i])
@@ -86,6 +87,22 @@ void Arrangement::regenerate (juce::uint64 newSeed)
         hitSeeds[i] = hashCombine (seed, (juce::uint64) i);
         forceOwn[i] = 0;
     }
+}
+
+void Arrangement::regenerateRhythm (juce::uint64 newSeed)
+{
+    // buildHits uses the seed (Free / Random patterns and the motif); rhythmSeed decides the
+    // reverses, octaves and rolls. The per-hit seeds - and with them the sources - stay as they are.
+    seed = newSeed;
+    rhythmSeed = hashCombine (newSeed, 0x7A1Full);
+}
+
+void Arrangement::regenerateSources (juce::uint64 salt)
+{
+    // only new source seeds: forceOwn stays as it is, otherwise the motif repeat would be gone
+    for (size_t i = 0; i < hitSeeds.size(); ++i)
+        if (! locked[i])
+            hitSeeds[i] = hashCombine (hitSeeds[i], salt);
 }
 
 void Arrangement::reroll (size_t i, juce::uint64 salt)
@@ -747,6 +764,7 @@ PreparedSlot engine::prepare (const SlotAudio& a, const SlotState& state, int ef
     p.transpose = effTranspose;
     p.withOctave = withOctave;
     p.mode = mode;
+    p.weight = juce::jlimit (0.0f, 2.0f, state.weight);
 
     if (a.original == nullptr)
         return p;
@@ -1131,7 +1149,7 @@ namespace
 std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNumSlots>& slots,
                                               const std::array<bool, kNumSlots>& enabled,
                                               const Settings& s, const Arrangement& arr,
-                                              const std::vector<Hit>& hits, double hostBpm, double rate)
+                                              const std::vector<Hit>& hits, double hostBpm, double rate, int onlySlot)
 {
     auto result = std::make_shared<RenderResult>();
     result->bpm  = hostBpm;
@@ -1202,8 +1220,12 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
         const double uSlot  = uniform (st);
         const double uChaos = uniform (st);
         const double uPos   = uniform (st);
-        const double uRev   = uniform (st);
-        const double uOct   = uniform (st);
+        // The "character" of a hit (reverse, octave, rolls) comes from its own stream, so a new rhythm
+        // keeps the sources. A locked hit uses its own seed for that too, so it never changes at all.
+        const juce::uint64 characterSeed = isLocked ? hashCombine (own, 0x51CEull) : arr.rhythmSeed;
+        juce::uint64 rt = hashCombine (seedToUse, characterSeed ^ 0x9E3779B97F4A7C15ull);
+        const double uRev   = uniform (rt);
+        const double uOct   = uniform (rt);
 
         // swing moves every odd 1/16; a hit ends where the (possibly swung) next position starts
         auto swungPos = [&] (double step)
@@ -1219,7 +1241,24 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
         // position inside a source, in beats
         auto choose = [&] (double slotDraw, double posDraw, bool keepPosition, bool octaveOn, int& slotOut, double& beatsOut)
         {
-            slotOut = active[(size_t) juce::jmin ((int) active.size() - 1, (int) (slotDraw * active.size()))];
+            {
+                // every sample has a share: its weight (0 = never, 1 = normal, 2 = twice as often)
+                double total = 0.0;
+                for (int a2 : active) total += juce::jmax (0.0f, slots[(size_t) a2].weight);
+                int picked = active.back();
+                if (total > 1.0e-6)
+                {
+                    double x = slotDraw * total, acc = 0.0;
+                    for (int a2 : active)
+                    {
+                        acc += juce::jmax (0.0f, slots[(size_t) a2].weight);
+                        if (x < acc) { picked = a2; break; }
+                    }
+                }
+                else
+                    picked = active[(size_t) juce::jmin ((int) active.size() - 1, (int) (slotDraw * active.size()))];
+                slotOut = picked;
+            }
             const auto& ps = slots[(size_t) slotOut];
             const auto& src = bufferOf (slotOut, octaveOn);
             const double bl = beatLenOf (slotOut, octaveOn);
@@ -1327,6 +1366,35 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
                 c.glitchDiv = ks[juce::jlimit (0, 4, (int) (uK * (2.0 + 3.0 * s.amount)))];
             }
         }
+        // FIT TO TRACK: skip hits that land where your own track is already busy
+        const bool inFillZone = s.fillBars > 0
+            && std::fmod (hit.startStep, 16.0 * juce::jmin (s.fillBars, s.bars))
+                 >= 16.0 * juce::jmin (s.fillBars, s.bars) - juce::jmin (8.0, 16.0 * juce::jmin (s.fillBars, s.bars) * 0.5) - 1.0e-6;
+        if (s.fit > 0.001f && ! isLocked && ! inFillZone)   // a fill always stays
+        {
+            const int step = ((int) std::llround (hit.startStep)) % 16;
+            const float busy = s.fitProfile[(size_t) juce::jlimit (0, 15, step)];
+            juce::uint64 ft = hashCombine (rt, 0xF17ull);
+            if (busy > 0.35f && uniform (ft) < juce::jlimit (0.0, 0.95, (double) (s.fit * (busy - 0.35f) / 0.65f)))
+                continue;   // leave this spot to the track
+        }
+
+        // energy: the further into the loop, the more glitch, octaves and reverses
+        if (s.energy > 0.001f)
+        {
+            const double pos = s.bars > 0 ? juce::jlimit (0.0, 1.0, hit.startStep / (16.0 * s.bars)) : 0.0;
+            const double amount = s.energy * pos;
+            juce::uint64 e = hashCombine (rt, 0xE11Eull);
+            const double eGlitch = uniform (e), eKind = uniform (e), eOct = uniform (e), eRev = uniform (e);
+            if (eGlitch < amount * 0.55 && c.glitch == 0)
+            {
+                c.glitch = eKind < 0.6 ? 1 : 2;
+                c.glitchDiv = amount < 0.4 ? 2 : (amount < 0.7 ? 4 : 8);
+            }
+            if (eOct < amount * 0.3 && slots[(size_t) c.slot].audioOctave != nullptr) c.octave = true;
+            if (eRev < amount * 0.12) c.reversed = true;
+        }
+
         // phrase fill: the last half bar of every phrase rolls, faster and faster
         if (s.fillBars > 0)
         {
@@ -1336,7 +1404,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
             if (inPhrase >= phraseSteps - zone - 1.0e-6)
             {
                 const double into = (inPhrase - (phraseSteps - zone)) / zone;   // 0 .. 1
-                juce::uint64 f = hashCombine (seedToUse, 0xF111ull);
+                juce::uint64 f = hashCombine (rt, 0xF111ull);
                 c.glitch = uniform (f) < 0.5 ? 1 : 2;                               // stutter or rising stutter
                 c.glitchDiv = into < 0.5 ? 2 : (into < 0.75 ? 4 : 8);
                 c.reversed = false;
@@ -1599,6 +1667,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
 
     for (const auto& p : pieces)
     {
+        if (onlySlot >= 0 && p.slot != onlySlot)
+            continue;   // stems: the same loop, but only the slices of this sample
         const auto& src = *p.src;
         const juce::int64 srcLen = src.getNumSamples();
         const int srcCh = src.getNumChannels();
@@ -1761,11 +1831,156 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
         result->numDifferentSlices = (int) keys.size();
     }
 
-    if (s.style == styleLoFi)
-        applyLoFi (result->audio, rate, s.amount);
-
-    applyLimiter (result->audio, rate, -0.3f);
+    if (onlySlot < 0)   // a stem stays dry: Lo-Fi and the limiter are not linear, so they belong on the mix
+    {
+        if (s.style == styleLoFi)
+            applyLoFi (result->audio, rate, s.amount);
+        applyLimiter (result->audio, rate, -0.3f);
+    }
     return result;
+}
+
+//==============================================================================
+/** Where does this audio have its weight inside a bar? One value per 1/16 step, 0..1.
+    Used by FIT TO TRACK: the new loop leaves room where your own track is busy. */
+std::array<float, 16> engine::gridProfile (const juce::AudioBuffer<float>& b, double rate, double bpm)
+{
+    std::array<float, 16> out {};
+    const int n = b.getNumSamples();
+    if (n < 64 || rate <= 0.0 || bpm < 20.0 || bpm > 400.0 || b.getNumChannels() == 0)
+        return out;
+
+    const double stepLen = rate * 60.0 / bpm / 4.0;         // one 1/16 in samples
+    const int win = juce::jlimit (64, (int) stepLen, (int) (rate * 0.045));   // 45 ms from every step
+
+    // where does the music start? A loop that was trimmed a little late would otherwise
+    // put its downbeat on the wrong step.
+    int offset = 0;
+    {
+        const int hop = juce::jmax (32, (int) (rate * 0.005));
+        double loudest = 0.0;
+        std::vector<double> frames;
+        for (int i = 0; i + hop <= n; i += hop)
+        {
+            double e = 0.0;
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+            {
+                const float* d = b.getReadPointer (ch) + i;
+                for (int k = 0; k < hop; ++k) e += (double) d[k] * d[k];
+            }
+            frames.push_back (e / (hop * b.getNumChannels()));
+            loudest = juce::jmax (loudest, frames.back());
+        }
+        for (size_t f = 0; f < frames.size(); ++f)
+            if (frames[f] > loudest * 0.08)
+            {
+                const int start = (int) f * hop;
+                if (start < (int) (stepLen * 0.75))      // only a small trim at the head counts
+                    offset = start;
+                break;
+            }
+    }
+
+    std::array<double, 16> sum {};
+    std::array<int, 16> count {};
+    const int steps = (int) std::floor ((n - offset) / stepLen) / 16 * 16;   // whole bars only
+    if (steps < 16)
+        return out;                                      // shorter than a bar: no opinion
+    for (int st = 0; st < steps; ++st)
+    {
+        const int start = offset + (int) (st * stepLen);
+        const int len = juce::jmin (win, n - start);
+        if (len < 32)
+            break;
+        double e = 0.0;
+        for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        {
+            const float* d = b.getReadPointer (ch) + start;
+            for (int i = 0; i < len; ++i)
+                e += (double) d[i] * d[i];
+        }
+        sum[(size_t) (st % 16)] += e / (len * b.getNumChannels());
+        ++count[(size_t) (st % 16)];
+    }
+    double mx = 0.0, mn = 1.0e12;
+    std::array<double, 16> rms {};
+    for (int i = 0; i < 16; ++i)
+    {
+        rms[(size_t) i] = count[(size_t) i] > 0 ? std::sqrt (sum[(size_t) i] / count[(size_t) i]) : 0.0;
+        mx = juce::jmax (mx, rms[(size_t) i]);
+        mn = juce::jmin (mn, rms[(size_t) i]);
+    }
+    // an even sound (a pad, a drone) has no busy spots: then there is nothing to fit around
+    if (mx < 1.0e-5 || mx - mn < mx * 0.35)
+        return out;
+    for (int i = 0; i < 16; ++i)
+        out[(size_t) i] = (float) juce::jlimit (0.0, 1.0, (rms[(size_t) i] - mn) / (mx - mn));
+    return out;
+}
+
+/** A quick opinion about a loop: is there enough going on, is it spread over the samples,
+    is there no big hole in it and does it not sound like one long note? 0..1 */
+double engine::scoreLoop (const RenderResult& r, double fillTargetScale)
+{
+    const int n = r.audio.getNumSamples();
+    if (n < 64 || r.segments.empty())
+        return 0.0;
+
+    // 1. how much of the loop actually sounds (no long silences)
+    const int win = juce::jmax (64, (int) (r.rate * 0.02));
+    int windows = 0, loud = 0;
+    double sumSq = 0.0, peak = 0.0;
+    for (int i = 0; i + win <= n; i += win)
+    {
+        double e = 0.0;
+        for (int k = 0; k < win; ++k)
+            for (int ch = 0; ch < r.audio.getNumChannels(); ++ch)
+            {
+                const double v = r.audio.getSample (ch, i + k);
+                e += v * v / r.audio.getNumChannels();
+                peak = juce::jmax (peak, std::abs (v));
+            }
+        const double rms = std::sqrt (e / win);
+        sumSq += e;
+        ++windows;
+        loud += rms > 0.01 ? 1 : 0;   // > -40 dB
+    }
+    if (windows == 0 || peak < 1.0e-4)
+        return 0.0;
+    const double fill = (double) loud / windows;                       // 0..1
+    const double rmsAll = std::sqrt (sumSq / juce::jmax (1, windows * win));
+    const double crest = peak / juce::jmax (1.0e-6, rmsAll);           // punch
+
+    // 2. how well the slices are spread over the samples that are on
+    std::array<int, kNumSlots> perSlot {};
+    for (const auto& sg : r.segments)
+        if (juce::isPositiveAndBelow (sg.slot, kNumSlots))
+            ++perSlot[(size_t) sg.slot];
+    int used = 0;
+    double entropy = 0.0;
+    for (auto c : perSlot)
+        if (c > 0)
+        {
+            ++used;
+            const double p = (double) c / (double) r.segments.size();
+            entropy -= p * std::log (p);
+        }
+    const double spread = used > 1 ? entropy / std::log ((double) used) : 0.0;   // 0..1
+
+    // 3. variety: different sources and not everything reversed / octaved
+    int different = 0, glitch = 0;
+    for (const auto& sg : r.segments)
+        glitch += sg.glitch ? 1 : 0;
+    different = r.numDifferentSlices;
+    const double variety = juce::jlimit (0.0, 1.0, different / juce::jmax (1.0, r.segments.size() * 0.6));
+    const double glitchPart = (double) glitch / (double) r.segments.size();
+
+    // put it together: a full but punchy loop, nicely spread, varied, not one big stutter
+    const double scale = juce::jlimit (0.3, 1.0, fillTargetScale);
+    const double fillScore   = juce::jlimit (0.0, 1.0, (fill - 0.35 * scale) / (0.5 * scale));
+    const double crestScore  = juce::jlimit (0.0, 1.0, 1.0 - std::abs (crest - 5.0) / 6.0);
+    const double glitchScore = juce::jlimit (0.0, 1.0, 1.0 - std::abs (glitchPart - 0.15) / 0.5);
+    return juce::jlimit (0.0, 1.0, 0.34 * fillScore + 0.2 * crestScore + 0.24 * spread + 0.14 * variety + 0.08 * glitchScore);
 }
 
 //==============================================================================

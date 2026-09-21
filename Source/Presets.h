@@ -30,6 +30,8 @@ public:
     static juce::File getUserFolder();
     static juce::File fileForName (const juce::String& presetName);
     static constexpr const char* fileExtension = ".chupapreset";
+    /** FX, fill and time feel are kept when a factory preset doesn't set them. */
+    static bool isKeptParameter (const juce::String& id);
 
     void rescanUserPresets();
     int  getNumPresets() const;

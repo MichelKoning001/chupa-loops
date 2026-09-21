@@ -23,7 +23,7 @@ public:
 
         bool isNeutral() const
         {
-            return cutoff >= 0.999f && env <= 0.001f && pump <= 0.001f && drive <= 0.001f && lowCut <= 0.001f
+            return cutoff >= 0.999f && reso <= 0.001f && env <= 0.001f && pump <= 0.001f && drive <= 0.001f && lowCut <= 0.001f
                 && std::abs (width - 1.0f) < 0.001f;
         }
     };

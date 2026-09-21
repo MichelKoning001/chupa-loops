@@ -16,15 +16,21 @@ Feed it up to 8 loops (basslines, for example). Chupa Loops cuts them into slice
 - **Rhythms:** Free, 4 to the floor, Offbeat, Offbeat 2x, Rolling 16th, Rolling KBBB, Gallop, Broken, Random, plus a phrase **Fill** every 4, 8, 16 or 32 bars.
 - **Style:** **Clean** (seamless, phase-aligned joins), **Glitch** (stutters, tape stops, chops) or **Lo-Fi** (crunchy vintage sampler).
 - **100 presets** in 10 flavors (Trance Treats, Hard Candy, Psy Sweets, Techno Toffee, House Candy, Breakbeat Brittle, Glitch Gummies, Lo-Fi Liquorice, Rave Candy, Pick 'n' Mix), a preset browser with search, and your own presets as files you can share.
-- **7 skins:** Lolly, Fruity, Skull, Butcher, Neon, Acid and Smile. Each one has its own lolly mascot that reacts when you make a new loop.
+- **7 skins:** Lolly, Fruity, Skull, Butcher, Neon, Acid and Smile, each with a lolly mascot that reacts when you make a new loop (Lolly and Fruity share the swirl lolly in their own colours).
 - **The craziest loop ever:** every skin has its own wild button (Sugar Rush, Fruit Punch, Skull Damage, The Butcher Cut, Neon Overdrive, Acid Flashback, Smiley Mayhem) that throws the rhythm, slicing and character around and makes a new loop.
 - **FX rack** (finishing layer on the whole loop): low-pass with per-slice envelope, resonance, low cut, drive, sidechain pump and stereo width.
+- **FIT TO TRACK:** right-click a sample and mark it as *my track*. That slot is not sliced: the new loop leaves room where your track is busy (a 1/16 grid profile of its energy) and the key follows it.
+- **Share per sample:** how often slices come from each slot (0-200%), and a play button to hear a sample on its own.
+- **Energy:** the loop gets busier and more glitchy towards the end.
+- **Time feel:** half time or double time on the sample material, with the beat grid unchanged.
+- **AUTO PICK:** makes eight loops, scores them (full enough, punchy, nicely spread, varied) and keeps the best one. **KEEP** parks a loop in the first free scene.
+- **RHY / SRC:** re-roll only the rhythm (same sounds) or only the sources (same groove).
 - **MUTATE** (a variation: a quarter of the unlocked slices change) and **scenes A–H** to store and recall favorite loops live.
 - **Play it as an instrument** (MIDI NOTES): **Slices** = C1 plays the whole loop, C#1 and up every different slice; **Keys** = the loop follows the key you play (C3 = original pitch).
 - **MIDI control** (MIDI NOTES = Control; note names with middle C = C3): C1 = new loop, C#1/D1 = previous/next version, D#1 = unlock all, E1 = the skin's crazy button, F1 = mutate, C2–G#2 = rhythm, C3–F3 = length, C4–G4 = scenes A–H, program change = preset (0 = Init, 1–100 = factory presets). Right-click any knob or selector to **MIDI learn** a CC. The **New Loop** parameter can be automated.
 - **Fix one slice at a time.** Click a slice to replace just that slice. Right-click to lock it. Use ◀ ▶ to go back to earlier versions (with their settings).
 - **Plays in sync** with your DAW. **PREVIEW** lets you listen without the transport.
-- **Into your project:** drag the loop out as **WAV** or as **MIDI** (one note per slice), or export a WAV, a MIDI file or a **slice kit** (every slice as a WAV + the MIDI).
+- **Into your project:** drag the loop out as **WAV** or as **MIDI** (one note per slice), or export a WAV, a MIDI file, a **slice kit** (every slice as a WAV + the MIDI) or **stems** (one WAV per sample).
 - **Saved with your project,** including the samples themselves (embedded FLAC, up to 64 seconds per slot).
 - **Standalone app** included, and a short first-run tour.
 - **Checked** in every build with Apple's `auval`, Tracktion's `pluginval` and the engine tests (logged, non-blocking). The audio, preset and MIDI tests in `tests/` run locally.

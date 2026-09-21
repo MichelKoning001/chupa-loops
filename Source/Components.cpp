@@ -1,4 +1,5 @@
 #include "Components.h"
+#include <cstring>
 #include "SliceTribeData.h"
 
 namespace slicetribe
@@ -605,6 +606,18 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     powerButton.onClick = [this] { proc.setSlotEnabled (index, ! info.enabled); };
     addAndMakeVisible (powerButton);
 
+    weightField.minValue = 0; weightField.maxValue = 200; weightField.step = 5; weightField.pixelsPerStep = 2;
+    weightField.format = [] (double v) { return juce::String ((int) v) + "%"; };
+    weightField.onDragEnd = [this] (double v) { proc.setSlotWeight (index, (float) (v / 100.0)); };
+    weightField.onReset = [this] { proc.setSlotWeight (index, 1.0f); };
+    weightField.setTooltip ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%.");
+    addAndMakeVisible (weightField);
+
+    playButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb6"));
+    playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping).\nClick again to stop.");
+    playButton.onClick = [this] { proc.setSlotPreview (index); };
+    addAndMakeVisible (playButton);
+
     clearButton.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));
     clearButton.setTooltip ("Clear slot");
     clearButton.onClick = [this] { proc.clearSlot (index); };
@@ -620,6 +633,14 @@ void SlotComponent::refresh (const SlotInfo& i)
     bpmField.setVisible (show);
     transposeField.setVisible (show);
     powerButton.setVisible (show);
+    playButton.setVisible (show);
+    weightField.setVisible (show);
+    weightField.setValue (juce::roundToInt (info.weight * 100.0f));
+    weightField.highlighted = info.reference || std::abs (info.weight - 1.0f) > 0.01f;
+    weightField.setTooltip (info.reference
+        ? juce::String ("FIT: how hard the new loop stays out of your track's way. 0% = not at all, 200% = really out of the way.")
+        : juce::String ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%."));
+    weightField.colour = colours::slot (index);
     clearButton.setVisible (show || info.missing || info.error);
     powerButton.setToggleState (info.enabled, juce::dontSendNotification);
     powerButton.setButtonText (info.enabled ? "ON" : "OFF");
@@ -642,8 +663,20 @@ void SlotComponent::refresh (const SlotInfo& i)
         tip = "The file was moved or deleted. Click to locate it, or drop the file here.";
     else if (info.error)
         tip = "This file can't be read. Use WAV, AIFF, FLAC, MP3 or OGG.";
+    if (info.reference)
+        tip = info.name + "\nYour own track: it is not sliced. The new loop leaves room where this track is busy,\n"
+                          "and the key follows this sample. Right-click to turn it off.";
     setTooltip (tip);
     repaint();
+}
+
+void SlotComponent::setPreviewing (bool p)
+{
+    if (p == previewing)
+        return;
+    previewing = p;
+    playButton.setButtonText (juce::String::fromUTF8 (p ? "\xe2\x96\xa0" : "\xe2\x96\xb6"));
+    playButton.setToggleState (p, juce::dontSendNotification);
 }
 
 void SlotComponent::resized()
@@ -651,12 +684,15 @@ void SlotComponent::resized()
     auto r = getLocalBounds().reduced (10, 8);
     r.removeFromLeft (26);
     auto bottom = r.removeFromBottom (22);
+    playButton.setBounds (bottom.removeFromLeft (30));
+    bottom.removeFromLeft (6);
     powerButton.setBounds (bottom.removeFromRight (44));
     bottom.removeFromRight (6);
-    transposeField.setBounds (bottom.removeFromRight (52));
+    transposeField.setBounds (bottom.removeFromRight (50));
     bottom.removeFromRight (6);
-    bpmField.setBounds (bottom.removeFromRight (80));
+    bpmField.setBounds (bottom.removeFromRight (74));
     clearButton.setBounds (getWidth() - 30, 8, 20, 20);
+    weightField.setBounds (getWidth() - 84, 8, 48, 20);
 }
 
 void SlotComponent::paint (juce::Graphics& g)
@@ -706,7 +742,7 @@ void SlotComponent::paint (juce::Graphics& g)
     }
 
     // title row: name ... [key] [+x%]
-    auto tags = title.withTrimmedRight (24.0f);
+    auto tags = title.withTrimmedRight (80.0f);   // room for the share field and the clear button
     auto drawTag = [&] (const juce::String& t, juce::Colour c)
     {
         const float w = juce::GlyphArrangement::getStringWidth (uiFont (10.5f, 1), t) + 10.0f;
@@ -718,6 +754,8 @@ void SlotComponent::paint (juce::Graphics& g)
         g.setFont (uiFont (10.5f, 1));
         g.drawText (t, tr, juce::Justification::centred);
     };
+    if (info.reference)
+        drawTag ("MY TRACK", colours::cyan());
     const double stretchPct = (info.stretchRatio - 1.0) * 100.0;
     if (std::abs (stretchPct) >= 0.5)
         drawTag ((stretchPct > 0 ? "+" : "") + juce::String (juce::roundToInt (stretchPct)) + "%", colours::dim());
@@ -767,7 +805,26 @@ void SlotComponent::paintOverChildren (juce::Graphics& g)
 
 void SlotComponent::mouseUp (const juce::MouseEvent& e)
 {
-    if (e.mouseWasClicked() && ! info.loaded && ! info.loading)
+    if (! e.mouseWasClicked())
+        return;
+    if (e.mods.isPopupMenu() && (info.loaded || info.loading))
+    {
+        juce::PopupMenu m;
+        m.addSectionHeader (info.name.isNotEmpty() ? info.name.toUpperCase() : juce::String ("SAMPLE"));
+        m.addItem (1, "Use as my track (FIT TO TRACK)", true, info.reference);
+        m.addItem (2, "Listen to this sample", true, proc.getSlotPreview() == index);
+        m.addItem (3, "Clear slot");
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+                         [safe = juce::Component::SafePointer<SlotComponent> (this)] (int r)
+        {
+            if (safe == nullptr) return;
+            if (r == 1) safe->proc.setSlotReference (safe->index, ! safe->info.reference);
+            if (r == 2) safe->proc.setSlotPreview (safe->index);
+            if (r == 3) safe->proc.clearSlot (safe->index);
+        });
+        return;
+    }
+    if (! info.loaded && ! info.loading)
         openFileChooser();
 }
 
@@ -946,7 +1003,7 @@ void ResultView::paint (juce::Graphics& g)
 
     // centre: message, hover info or hint
     {
-        auto centre = header.withTrimmedLeft (110.0f);
+        auto centre = header.withTrimmedLeft (250.0f);   // room for the AUTO PICK and KEEP buttons
         g.setFont (uiFont (12.0f, messageTicks > 0 ? 1 : 0));
         if (messageTicks > 0)
         {
@@ -956,17 +1013,20 @@ void ResultView::paint (juce::Graphics& g)
         else if (result != nullptr && hoverSeg >= 0 && hoverSeg < (int) result->segments.size())
         {
             const auto& seg = result->segments[(size_t) hoverSeg];
-            g.setColour (colours::slot (seg.slot));
-            g.fillEllipse (centre.getX() + 6.0f, centre.getCentreY() - 4.0f, 8.0f, 8.0f);   // which slot, as a colour dot
-            g.setColour (colours::text());
             juce::String segFlags;
             if (seg.reversed) segFlags << ", reversed";
             if (seg.glitch)   segFlags << ", glitch";
             if (seg.octave)   segFlags << ", +1 octave";
             if (seg.locked)   segFlags << ", locked";
-            g.drawText ("Slice " + juce::String (seg.hitIndex + 1) + " from sample " + juce::String (seg.slot + 1) + segFlags
-                            + juce::String::fromUTF8 ("   \xc2\xb7   click = new slice   \xc2\xb7   right-click = ") + (seg.locked ? "unlock" : "lock"),
-                        centre, juce::Justification::centred);
+            const auto text = "Slice " + juce::String (seg.hitIndex + 1) + " from sample " + juce::String (seg.slot + 1) + segFlags
+                            + juce::String::fromUTF8 ("   \xc2\xb7   click = new slice   \xc2\xb7   right-click = ") + (seg.locked ? "unlock" : "lock");
+            const auto f = uiFont (12.0f);
+            const float tw = juce::jmin (centre.getWidth() - 16.0f, juce::GlyphArrangement::getStringWidth (f, text));
+            auto row = centre.withSizeKeepingCentre (tw + 16.0f, centre.getHeight());
+            g.setColour (colours::slot (seg.slot));
+            g.fillEllipse (row.getX(), row.getCentreY() - 4.0f, 8.0f, 8.0f);   // which slot, as a colour dot
+            g.setColour (colours::text());
+            g.drawFittedText (text, row.withTrimmedLeft (14.0f).toNearestInt(), juce::Justification::centredLeft, 1, 0.85f);
         }
         else if (result != nullptr && ! result->segments.empty())
         {

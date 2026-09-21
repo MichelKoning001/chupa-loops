@@ -35,6 +35,8 @@ namespace choices
     inline const int               fillBars[] { 0, 4, 8, 16, 32 };
 
     inline const juce::StringArray midiModes { "Control", "Slices", "Keys" };
+    inline const juce::StringArray feels     { "Normal", "Half time", "Double time" };
+    inline const double            feelFactor[] { 1.0, 2.0, 0.5 };   // multiplies the source tempo
 
     inline const juce::StringArray styles    { "Clean", "Glitch", "Lo-Fi" };
     inline const juce::StringArray stretchModes { "Beats", "Smooth" };
@@ -71,6 +73,10 @@ struct Settings
     float  amount      = 0.5f;    // 0..1, strength of Glitch / Lo-Fi
     int    stretchMode = stretchBeats;
     int    fillBars    = 0;       // 0 = off: a roll at the end of every phrase of this many bars
+    float  energy      = 0.0f;    // 0..1: the loop gets busier and more glitchy towards the end
+    int    feel        = 0;       // 0 normal, 1 half time, 2 double time (speed of the source material)
+    float  fit         = 0.0f;    // 0..2: how hard the loop stays out of the reference track's way
+    std::array<float, 16> fitProfile {};   // how busy the reference track is on every 1/16 of a bar
 
     bool structureEquals (const Settings& o) const
     {
@@ -94,12 +100,15 @@ struct Hit
 struct Arrangement
 {
     juce::uint64 seed = 1;
+    juce::uint64 rhythmSeed = 1;   // reverses, octaves and rolls: changed by "new rhythm", kept by "new sources"
     std::vector<juce::uint64> hitSeeds;
     std::vector<juce::uint8>  locked;
     std::vector<juce::uint8>  forceOwn;   // a re-rolled hit inside a repeated motif
 
     void resizeFor (size_t numHits);
     void regenerate (juce::uint64 newSeed);      // keeps locked hits
+    void regenerateRhythm (juce::uint64 newSeed);// only the rhythm seed: the sources stay
+    void regenerateSources (juce::uint64 salt);  // only the sources: the rhythm stays
     void reroll (size_t hitIndex, juce::uint64 salt);
     int  numLocked() const;
 };
@@ -114,6 +123,7 @@ struct SlotAudio
     double detectedBpm = 0.0;
     int detectedKey = -1;         // root*2 + minor (0..23), -1 = unknown
     std::vector<float> peaks;     // min/max pairs for the UI thumbnail
+    std::array<float, 16> gridProfile {};   // how busy every 1/16 of a bar is (0..1), for FIT TO TRACK
     int loadId = 0;               // changes every time a new file is loaded
 };
 
@@ -128,6 +138,7 @@ struct PreparedSlot
     std::vector<int> onsets;          // in `audio` samples (slice-mode sensitivity)
     std::vector<int> warpOnsets;      // attacks used by the Beats warp (fixed sensitivity)
     double hostBpm = 0, rate = 0, srcBpm = 0;
+    float weight = 1.0f;
     int transpose = 0;                // effective (manual + key match)
     int mode = stretchBeats;
     bool withOctave = false;
@@ -141,6 +152,8 @@ struct SlotState
     bool   enabled = true;
     double bpmOverride = 0.0;   // 0 = auto
     int    transpose = 0;       // manual, -12..12
+    float  weight = 1.0f;       // 0..2: how often slices are taken from this sample (1 = normal share)
+    bool   reference = false;   // "my track": not sliced, the new loop fits around it
 };
 
 //==============================================================================
@@ -161,7 +174,7 @@ struct RenderResult
     Settings settings;   // what this loop was rendered with
     int key = -1;        // key-match target it was rendered with (-1 = off)
     // MIDI slice notes: every different slice gets one key (C#1 = 37 and up; repeats share their key)
-    static constexpr int firstSliceNote = 37, maxSliceNotes = 91;   // C#1 .. G9
+    static constexpr int firstSliceNote = 37, maxSliceNotes = 91;   // C#1 .. G8 (notes 37-127)
     std::vector<int> segmentNote;    // per segment: 0-based slice note, -1 = beyond the keyboard
     std::vector<int> noteSegment;    // per slice note: the segment it plays
     int numDifferentSlices = 0;      // may be more than maxSliceNotes
@@ -208,6 +221,12 @@ namespace engine
     /** Transient detection. sensitivity 0..1; beatLen = samples per beat in this buffer. */
     std::vector<int> detectOnsets (const juce::AudioBuffer<float>&, double beatLen, float sensitivity);
 
+    /** How busy every 1/16 of a bar is in this audio (0..1 per step), for FIT TO TRACK. */
+    std::array<float, 16> gridProfile (const juce::AudioBuffer<float>&, double rate, double bpm);
+
+    /** How good does this loop sound on paper? 0..1 (used by AUTO PICK). */
+    double scoreLoop (const RenderResult&, double fillTargetScale = 1.0);
+
     /** Build the hit list for the given settings. */
     std::vector<Hit> buildHits (const Settings&, juce::uint64 seed);
 
@@ -215,7 +234,8 @@ namespace engine
     std::shared_ptr<RenderResult> render (const std::array<PreparedSlot, kNumSlots>&,
                                           const std::array<bool, kNumSlots>& enabled,
                                           const Settings&, const Arrangement&,
-                                          const std::vector<Hit>&, double hostBpm, double rate);
+                                          const std::vector<Hit>&, double hostBpm, double rate,
+                                          int onlySlot = -1);   // >= 0: only the slices of that sample (stems)
 
     /** Lo-Fi colouring (saturation, sample-rate & bit reduction, low-pass). Loop-seamless. */
     void applyLoFi (juce::AudioBuffer<float>&, double rate, float amount);
