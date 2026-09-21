@@ -253,8 +253,8 @@ int main()
     };
 
     std::array<SlotAudio, kNumSlots> audio;
-    std::array<PreparedSlot, kNumSlots> prepared;
-    std::array<bool, kNumSlots> enabled {};
+    std::array<PreparedSlot, kAllSlots> prepared;
+    std::array<bool, kAllSlots> enabled {};
     for (size_t i = 0; i < defs.size(); ++i)
     {
         auto& d = defs[i];
@@ -436,8 +436,8 @@ int main()
         CHECK (wrapStep <= maxStep * 1.5f, "stretched loop wraps seamlessly");
 
         // swing does not create gaps: continuous source, rolling 16ths, 100% swing
-        std::array<PreparedSlot, kNumSlots> ps;
-        std::array<bool, kNumSlots> en {};
+        std::array<PreparedSlot, kAllSlots> ps;
+        std::array<bool, kAllSlots> en {};
         auto buf = std::make_shared<juce::AudioBuffer<float>> (2, (int) std::llround (16 * hostRate * 60.0 / hostBpm));
         for (int c = 0; c < 2; ++c)
             for (int i = 0; i < buf->getNumSamples(); ++i)
@@ -492,8 +492,8 @@ int main()
 
         for (int mode : { (int) stretchBeats, (int) stretchSmooth })
         {
-            std::array<PreparedSlot, kNumSlots> ps;
-            std::array<bool, kNumSlots> en {};
+            std::array<PreparedSlot, kAllSlots> ps;
+            std::array<bool, kAllSlots> en {};
             ps[0] = engine::prepare (sa, SlotState {}, 0, hostBpm, hostRate, false, mode);
             ps[0].onsets = engine::detectOnsets (*ps[0].audio, ps[0].beatLen, 0.5f);
             en[0] = true;
@@ -581,8 +581,8 @@ int main()
             SlotAudio sa;
             sa.original = std::make_shared<juce::AudioBuffer<float>> (clicks);
             sa.fileRate = srcRate; sa.detectedBpm = srcBpm;
-            std::array<PreparedSlot, kNumSlots> ps;
-            std::array<bool, kNumSlots> en {};
+            std::array<PreparedSlot, kAllSlots> ps;
+            std::array<bool, kAllSlots> en {};
             ps[0] = engine::prepare (sa, SlotState {}, wc.transpose, hostBpm, hostRate, wc.octave > 0, stretchBeats);
             ps[0].onsets = engine::detectOnsets (*ps[0].audio, ps[0].beatLen, 0.5f);
             ps[0].warpOnsets = engine::detectOnsets (*ps[0].audio, ps[0].beatLen, 0.6f);

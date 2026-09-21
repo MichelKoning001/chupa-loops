@@ -9,7 +9,9 @@
 namespace slicetribe
 {
 
-constexpr int kNumSlots = 8;
+constexpr int kNumSlots = 8;     // sample slots the new loop is built from
+constexpr int kTrackSlot = 8;    // the extra slot for a part of your own track (never sliced)
+constexpr int kAllSlots  = 9;    // everything the plug-in holds: the 8 samples plus your track
 constexpr double maxSampleSeconds = 128.0;   // longer files are truncated (32 bars at 60 bpm)
 constexpr double defaultBpm = 125.0;         // tempo we start on when no host tells us otherwise
 
@@ -144,6 +146,7 @@ struct PreparedSlot
     std::vector<int> warpOnsets;      // attacks used by the Beats warp (fixed sensitivity)
     double hostBpm = 0, rate = 0, srcBpm = 0;
     float weight = 1.0f;
+    float trimStart = 0.0f, trimEnd = 1.0f;   // slices are only taken from between these
     int transpose = 0;                // effective (manual + key match)
     int mode = stretchBeats;
     bool withOctave = false;
@@ -158,8 +161,8 @@ struct SlotState
     double bpmOverride = 0.0;   // 0 = auto
     int    transpose = 0;       // manual, -12..12
     float  weight = 1.0f;       // 0..2: how often slices are taken from this sample (1 = normal share)
-    bool   reference = false;   // "my track": not sliced, the new loop fits around it
-    float  weightBefore = -1.0f;// the share this slot had before FIT took the field over (-1 = none)
+    float  trimStart = 0.0f;    // only the part between these two lines is used (0..1 of the sample)
+    float  trimEnd   = 1.0f;
 };
 
 //==============================================================================
@@ -237,8 +240,8 @@ namespace engine
     std::vector<Hit> buildHits (const Settings&, juce::uint64 seed);
 
     /** Renders the loop. */
-    std::shared_ptr<RenderResult> render (const std::array<PreparedSlot, kNumSlots>&,
-                                          const std::array<bool, kNumSlots>& enabled,
+    std::shared_ptr<RenderResult> render (const std::array<PreparedSlot, kAllSlots>&,
+                                          const std::array<bool, kAllSlots>& enabled,
                                           const Settings&, const Arrangement&,
                                           const std::vector<Hit>&, double hostBpm, double rate,
                                           int onlySlot = -1);   // >= 0: only the slices of that sample (stems)

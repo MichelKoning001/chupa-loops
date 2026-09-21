@@ -102,6 +102,7 @@ private:
     AboutOverlay about;
     TourOverlay tour;
 
+    bool trackLoaded = false;
     int lastSlotsVersion = -1, lastResultVersion = -1, loadedCount = 0, lastSkin = -1,
         lastLearnVersion = -1, lastMidiEvent = -1, lastGenerate = -1, clearConfirmTicks = 0, learnTicks = 0, lastScenes = -1, lastSlotPreview = -2, lastJobVersion = -1;
     bool flashOnNextResult = false;

@@ -908,7 +908,7 @@ void SliceTribeProcessor::run()
         bool changed = false;
 
         // ---- 1. load files (also before the host has started audio) ----------------
-        for (int i = 0; i < kNumSlots && ! abortWork.load(); ++i)
+        for (int i = 0; i < kAllSlots && ! abortWork.load(); ++i)
         {
             PendingLoad job;
             {
@@ -960,8 +960,9 @@ void SliceTribeProcessor::run()
                 // anything you changed while the file was loading (FIT, share, tempo, transpose, on/off)
                 // lives in the pending state, not in the copy this job started with
                 const SlotState live = pending[(size_t) i].active ? pending[(size_t) i].state : job.state;
-                regrid = live.reference && a.original != nullptr
-                      && std::abs (live.bpmOverride - job.state.bpmOverride) > 1.0e-6;
+                regrid = i == kTrackSlot && a.original != nullptr
+                      && (std::abs (live.bpmOverride - job.state.bpmOverride) > 1.0e-6
+                          || live.trimStart > 0.001f || live.trimEnd < 0.999f);
                 pending[(size_t) i] = {};
                 a.loadId = nextLoadId++;
                 const bool missing = a.original == nullptr && job.file != juce::File();
@@ -971,15 +972,12 @@ void SliceTribeProcessor::run()
                 slotAudio[(size_t) i] = std::move (a);
                 slotState[(size_t) i] = live;
                 embeddedAudio[(size_t) i] = std::move (emb);
-                if (regrid)   // a tempo you typed during the load: the fit grid follows it
-                {
-                    auto& na = slotAudio[(size_t) i];
-                    na.gridProfile = engine::gridProfile (*na.original, na.fileRate,
-                                                          live.bpmOverride > 0.0 ? live.bpmOverride : na.detectedBpm);
-                }
+
             }
             slotsVersion.fetch_add (1);
-            updateFitFromSlots();   // a new sample can be (or replace) the reference track
+            if (regrid)
+                trackRegrid = true;   // a tempo or a trim from the project: measure that part
+            updateFitFromSlots();   // a new sample can be (or replace) your own track
             changed = true;
         }
 
@@ -1003,6 +1001,13 @@ void SliceTribeProcessor::run()
         }
         const bool bpmStable = isNonRealtime() || juce::Time::getMillisecondCounter() - bpmStableSince > 250;
 
+        if (trackRegrid.exchange (false))
+        {
+            regridTrack();
+            updateFitFromSlots();
+            changed = true;
+        }
+
         bool allPrepared = true;
         for (int i = 0; i < kNumSlots && ! abortWork.load(); ++i)
         {
@@ -1023,6 +1028,12 @@ void SliceTribeProcessor::run()
             if (std::abs (p.weight - st.weight) > 1.0e-6f)   // the share needs no new preparation
             {
                 p.weight = st.weight;
+                changed = true;
+            }
+            if (std::abs (p.trimStart - st.trimStart) > 1.0e-6f || std::abs (p.trimEnd - st.trimEnd) > 1.0e-6f)
+            {
+                p.trimStart = st.trimStart;   // and neither do the two lines
+                p.trimEnd = st.trimEnd;
                 changed = true;
             }
 
@@ -1125,12 +1136,11 @@ void SliceTribeProcessor::run()
                 lockedCount = arrangement.numLocked();
             }
 
-            std::array<bool, kNumSlots> enabled {};
+            std::array<bool, kAllSlots> enabled {};
             {
                 const juce::ScopedLock sl (slotLock);
-                for (int i = 0; i < kNumSlots; ++i)
-                    enabled[(size_t) i] = slotState[(size_t) i].enabled && ! slotState[(size_t) i].reference
-                                       && slotAudio[(size_t) i].original != nullptr;
+                for (int i = 0; i < kNumSlots; ++i)   // your own track (kTrackSlot) is never sliced
+                    enabled[(size_t) i] = slotState[(size_t) i].enabled && slotAudio[(size_t) i].original != nullptr;
             }
 
             auto rendered = engine::render (prepared, enabled, rs, arr, hits, bpm, rate);
@@ -1151,12 +1161,11 @@ void SliceTribeProcessor::run()
             Settings rs = s;
             while (rs.bars > 1 && rs.bars * 240.0 / bpm > 130.0)
                 rs.bars /= 2;
-            std::array<bool, kNumSlots> enabled {};
+            std::array<bool, kAllSlots> enabled {};
             {
                 const juce::ScopedLock sl (slotLock);
-                for (int i = 0; i < kNumSlots; ++i)
-                    enabled[(size_t) i] = slotState[(size_t) i].enabled && ! slotState[(size_t) i].reference
-                                       && slotAudio[(size_t) i].original != nullptr;
+                for (int i = 0; i < kNumSlots; ++i)   // your own track (kTrackSlot) is never sliced
+                    enabled[(size_t) i] = slotState[(size_t) i].enabled && slotAudio[(size_t) i].original != nullptr;
             }
             busy = true;
             if (const int n = autoPickRequest.exchange (0); n > 0)
@@ -1172,7 +1181,7 @@ void SliceTribeProcessor::run()
 }
 
 /** Makes a few loops, scores them and keeps the best one. */
-void SliceTribeProcessor::runAutoPick (const std::array<bool, kNumSlots>& enabled, const Settings& rs,
+void SliceTribeProcessor::runAutoPick (const std::array<bool, kAllSlots>& enabled, const Settings& rs,
                                        double bpm, double rate, int candidates)
 {
     Arrangement base;
@@ -1234,7 +1243,7 @@ void SliceTribeProcessor::runAutoPick (const std::array<bool, kNumSlots>& enable
 }
 
 /** Writes one WAV per sample: the same loop, but only the slices of that sample. */
-void SliceTribeProcessor::runStems (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate)
+void SliceTribeProcessor::runStems (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate)
 {
     juce::File folder;
     { const juce::ScopedLock jl (jobLock); folder = stemsFolder; }
@@ -1403,7 +1412,9 @@ SlotInfo SliceTribeProcessor::getSlotInfo (int i) const
     }
     info.enabled = st.enabled;
     info.weight = st.weight;
-    info.reference = st.reference;
+    info.reference = i == kTrackSlot;
+    info.trimStart = st.trimStart;
+    info.trimEnd = st.trimEnd;
     info.name = a.name.isNotEmpty() ? a.name
               : pending[(size_t) i].active ? pending[(size_t) i].file.getFileNameWithoutExtension()
               : missingFile[(size_t) i].getFileNameWithoutExtension();
@@ -1443,25 +1454,19 @@ void SliceTribeProcessor::queueLoad (int slot, const juce::File& f, const juce::
 
 void SliceTribeProcessor::loadSlot (int slot, const juce::File& f)
 {
-    if (! juce::isPositiveAndBelow (slot, kNumSlots))
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
         return;
     if (slotPreviewIndex.load() == slot)
         setSlotPreview (-1);
     SlotState st;
-    bool droppedReference = false;
     {
         // locating a missing file keeps the slot's tempo, transpose and on/off settings
         const juce::ScopedLock sl (slotLock);
         if (slotMissing[(size_t) slot])
             st = slotState[(size_t) slot];
-        else
-            droppedReference = releaseReference (slot);    // another sample: it is not your track any more
     }
-    if (droppedReference)
-    {
-        restoreKeyAfterReference();
-        updateFitFromSlots();
-    }
+    if (slot == kTrackSlot)
+        restoreKeyAfterReference();   // another track: the KEY of the old one goes away first
     queueLoad (slot, f, nullptr, st);
 }
 
@@ -1471,16 +1476,23 @@ void SliceTribeProcessor::setSlotPreview (int slot)
         slot = -1;                                  // clicking the playing slot again stops it
     std::shared_ptr<const juce::AudioBuffer<float>> audio;
     double fileRate = 44100.0;
-    if (juce::isPositiveAndBelow (slot, kNumSlots))
+    float trimA = 0.0f, trimB = 1.0f;
+    if (juce::isPositiveAndBelow (slot, kAllSlots))
     {
         const juce::ScopedLock sl (slotLock);
         audio = slotAudio[(size_t) slot].original;
         fileRate = slotAudio[(size_t) slot].fileRate;
+        trimA = slotState[(size_t) slot].trimStart;
+        trimB = slotState[(size_t) slot].trimEnd;
         if (audio == nullptr || audio->getNumSamples() < 2)
             slot = -1;
     }
     else
         slot = -1;
+    slotPreviewTrimStart = slot >= 0 ? trimA : 0.0f;
+    slotPreviewTrimEnd   = slot >= 0 ? trimB : 1.0f;
+    if (slot < 0)
+        slotPreviewPos = -1.0;
     if (slot >= 0)
     {
         // keep the previous buffers alive here, so the audio thread never frees one
@@ -1528,6 +1540,11 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
     const bool on = slotPreviewIndex.load() >= 0;
     const auto& b = *slotPlaying;
     const int len = b.getNumSamples();
+    // the two lines: listening plays only the part you picked
+    const int cutA = juce::jlimit (0, len - 2, (int) (slotPreviewTrimStart.load() * len));
+    const int cutB = juce::jlimit (cutA + 2, len, (int) (slotPreviewTrimEnd.load() * len));
+    if (slotPlayPos < cutA || slotPlayPos >= cutB)
+        slotPlayPos = cutA;
     const float* inL = b.getReadPointer (0);
     const float* inR = b.getReadPointer (b.getNumChannels() > 1 ? 1 : 0);
     float* outL = buffer.getWritePointer (0);
@@ -1541,16 +1558,17 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
         if (slotPlayGain <= 0.0f && ! on)
             return;   // faded out: stop reading (freeing the audio is the message thread's job)
         const int i0 = (int) juce::jlimit (0.0, (double) (len - 1), slotPlayPos);
-        const int i1 = i0 + 1 < len ? i0 + 1 : 0;
+        const int i1 = i0 + 1 < cutB ? i0 + 1 : cutA;
         const float f = (float) (slotPlayPos - i0);
         const float g = slotPlayGain * gain;
         outL[i] += (inL[i0] + (inL[i1] - inL[i0]) * f) * g;
         if (outR != nullptr)
             outR[i] += (inR[i0] + (inR[i1] - inR[i0]) * f) * g;
         slotPlayPos += slotPlayStep;
-        if (slotPlayPos >= len)
-            slotPlayPos -= len;
+        if (slotPlayPos >= cutB)
+            slotPlayPos = cutA;
     }
+    slotPreviewPos = len > 1 ? slotPlayPos / (double) len : -1.0;
 }
 
 void SliceTribeProcessor::clearSlot (int slot)
@@ -1560,8 +1578,7 @@ void SliceTribeProcessor::clearSlot (int slot)
     bool wasReference = false;
     {
         const juce::ScopedLock sl (slotLock);
-        wasReference = slotState[(size_t) slot].reference
-                    || (pending[(size_t) slot].active && pending[(size_t) slot].state.reference);
+        wasReference = slot == kTrackSlot;
         slotAudio[(size_t) slot] = {};
         slotState[(size_t) slot] = {};
         pending[(size_t) slot] = {};
@@ -1591,14 +1608,10 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
     {
         const juce::ScopedLock sl (slotLock);
         editSlotState (slot, [bpm] (SlotState& s2) { s2.bpmOverride = bpm > 0 ? juce::jlimit (40.0, 300.0, bpm) : 0.0; });
-        auto& st = slotState[(size_t) slot];
-        if (st.reference && slotAudio[(size_t) slot].original != nullptr)   // the fit grid follows the corrected tempo
-        {
-            auto& a = slotAudio[(size_t) slot];
-            a.gridProfile = engine::gridProfile (*a.original, a.fileRate, st.bpmOverride > 0.0 ? st.bpmOverride : a.detectedBpm);
-        }
     }
-    updateFitFromSlots();
+    if (slot == kTrackSlot)
+        trackRegrid = true;   // the fit grid follows the corrected tempo (measured by the worker)
+    prepareInterrupt = true;
     slotsVersion.fetch_add (1);
     requestUpdate();
 }
@@ -1612,7 +1625,7 @@ void SliceTribeProcessor::setSlotTranspose (int slot, int semis)
 
 void SliceTribeProcessor::setSlotWeight (int slot, float w)
 {
-    if (! juce::isPositiveAndBelow (slot, kNumSlots))
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
         return;
     { const juce::ScopedLock sl (slotLock); editSlotState (slot, [w] (SlotState& st) { st.weight = juce::jlimit (0.0f, 2.0f, w); }); }
     updateFitFromSlots();
@@ -1620,36 +1633,81 @@ void SliceTribeProcessor::setSlotWeight (int slot, float w)
     requestUpdate();
 }
 
-/** Collects the reference slot's profile into the lock-free copy the render settings read. */
+/** Measures how busy your own track is, over the part between the two lines (worker thread). */
+void SliceTribeProcessor::regridTrack()
+{
+    std::shared_ptr<const juce::AudioBuffer<float>> audio;
+    double fileRate = 44100.0, bpm = 0.0;
+    float a0 = 0.0f, a1 = 1.0f;
+    int loadId = -1;
+    {
+        const juce::ScopedLock sl (slotLock);
+        const auto& a = slotAudio[(size_t) kTrackSlot];
+        const auto& st = slotState[(size_t) kTrackSlot];
+        audio = a.original;
+        fileRate = a.fileRate;
+        bpm = st.bpmOverride > 0.0 ? st.bpmOverride : a.detectedBpm;
+        a0 = st.trimStart;
+        a1 = st.trimEnd;
+        loadId = a.loadId;
+    }
+    if (audio == nullptr)
+        return;
+
+    std::array<float, 16> profile {};
+    const int n = audio->getNumSamples();
+    const int s0 = juce::jlimit (0, n, (int) (a0 * n));
+    const int s1 = juce::jlimit (s0, n, (int) (a1 * n));
+    if (s1 - s0 >= 256 && bpm > 0.0)
+    {
+        if (s0 == 0 && s1 == n)
+        {
+            profile = engine::gridProfile (*audio, fileRate, bpm);
+        }
+        else
+        {
+            juce::AudioBuffer<float> part (audio->getNumChannels(), s1 - s0);
+            for (int ch = 0; ch < part.getNumChannels(); ++ch)
+                part.copyFrom (ch, 0, *audio, ch, s0, s1 - s0);
+            profile = engine::gridProfile (part, fileRate, bpm);
+        }
+    }
+    {
+        const juce::ScopedLock sl (slotLock);
+        if (slotAudio[(size_t) kTrackSlot].loadId == loadId)   // still the same file
+            slotAudio[(size_t) kTrackSlot].gridProfile = profile;
+    }
+}
+
+/** Collects your own track's profile into the lock-free copy the render settings read. */
 void SliceTribeProcessor::updateFitFromSlots()
 {
     int ref = -1;
     {
-    const juce::ScopedLock wl (fitWriteLock);   // worker and message thread both call this
-    float amount = 0.0f;
-    std::array<float, 16> profile {};
-    {
-        const juce::ScopedLock sl (slotLock);
-        for (int i = 0; i < kNumSlots; ++i)
-            if (slotState[(size_t) i].reference && slotAudio[(size_t) i].original != nullptr)
+        const juce::ScopedLock wl (fitWriteLock);   // worker and message thread both call this
+        float amount = 0.0f;
+        std::array<float, 16> profile {};
+        {
+            const juce::ScopedLock sl (slotLock);
+            if (slotAudio[(size_t) kTrackSlot].original != nullptr)
             {
-                ref = i;
-                amount = slotState[(size_t) i].weight;
-                profile = slotAudio[(size_t) i].gridProfile;
-                break;
+                ref = kTrackSlot;
+                amount = slotState[(size_t) kTrackSlot].weight;
+                profile = slotAudio[(size_t) kTrackSlot].gridProfile;
             }
-    }
-    fitVersion.fetch_add (1);
-    referenceSlot = ref;
-    fitAmount = ref >= 0 ? amount : 0.0f;
-    for (int i = 0; i < 16; ++i)
-        fitProfile[(size_t) i] = ref >= 0 ? profile[(size_t) i] : 0.0f;
-    fitVersion.fetch_add (1);
+        }
+        fitVersion.fetch_add (1);
+        referenceSlot = ref;
+        fitAmount = ref >= 0 ? amount : 0.0f;
+        for (int i = 0; i < 16; ++i)
+            fitProfile[(size_t) i] = ref >= 0 ? profile[(size_t) i] : 0.0f;
+        fitVersion.fetch_add (1);
     }
 
-    // outside the lock: this can end up asking the host for a parameter gesture
-    if (const int waiting = pendingReferenceKey.load(); waiting >= 0 && waiting == ref)
-        applyReferenceKey (waiting);
+    // outside the lock: this can end up asking the host for a parameter gesture.
+    // The key follows your own track as soon as it is there, and only takes KEY over once.
+    if (ref >= 0 && (keyBeforeReference.load() < 0 || pendingReferenceKey.load() >= 0))
+        applyReferenceKey (ref);
 }
 
 /** The loop follows the key of your own track (once it is loaded and its key is known). */
@@ -1663,13 +1721,25 @@ void SliceTribeProcessor::applyReferenceKey (int slot)
         return;
     }
     int key = -1;
-    { const juce::ScopedLock sl (slotLock); key = slotAudio[(size_t) slot].detectedKey; }
-    if (key < 0)
+    bool loaded = false;
+    {
+        const juce::ScopedLock sl (slotLock);
+        key = slotAudio[(size_t) slot].detectedKey;
+        loaded = slotAudio[(size_t) slot].original != nullptr;
+    }
+    if (! loaded)
     {
         pendingReferenceKey = slot;   // still loading: try again when it is ready
         return;
     }
     pendingReferenceKey = -1;
+    if (key < 0)
+    {
+        // a track without a key (drums, or a name that says nothing): KEY simply stays as it is
+        if (keyBeforeReference.load() < 0)
+            keyBeforeReference = (int) apvts.getRawParameterValue ("key")->load();
+        return;
+    }
     if (auto* prm = apvts.getParameter ("key"))
     {
         if (keyBeforeReference.load() < 0)
@@ -1688,22 +1758,7 @@ void SliceTribeProcessor::handleAsyncUpdate()
         applyReferenceKey (waiting);
 }
 
-/** FIT off for one slot: the % field goes back to being its share. Call with slotLock held. */
-bool SliceTribeProcessor::releaseReference (int slot)
-{
-    if (! slotState[(size_t) slot].reference)
-        return false;
-    editSlotState (slot, [] (SlotState& st)
-    {
-        st.reference = false;
-        if (st.weightBefore >= 0.0f)
-            st.weight = juce::jlimit (0.0f, 2.0f, st.weightBefore);
-        st.weightBefore = -1.0f;
-    });
-    return true;
-}
-
-/** Puts the KEY back the way it was before a track took it over (message thread). */
+/** Puts the KEY back the way it was before your own track took it over (message thread). */
 void SliceTribeProcessor::restoreKeyAfterReference()
 {
     pendingReferenceKey = -1;
@@ -1723,36 +1778,25 @@ void SliceTribeProcessor::restoreKeyAfterReference()
         }
 }
 
-void SliceTribeProcessor::setSlotReference (int slot, bool isReference)
+/** The two lines on a slot: only the part between them is used (0..1 of the sample). */
+void SliceTribeProcessor::setSlotTrim (int slot, float start, float end)
 {
-    if (! juce::isPositiveAndBelow (slot, kNumSlots))
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
         return;
-    bool wasReference = false;
+    const float a = juce::jlimit (0.0f, 1.0f, start);
+    const float b = juce::jlimit (a, 1.0f, end);
     {
         const juce::ScopedLock sl (slotLock);
-        if (isReference)
-        {
-            for (int i = 0; i < kNumSlots; ++i)
-                if (i != slot)
-                    releaseReference (i);                  // only one track at a time
-            editSlotState (slot, [] (SlotState& st)
-            {
-                if (! st.reference)
-                    st.weightBefore = st.weight;           // the share comes back when FIT goes off
-                st.reference = true;
-                if (st.weight < 0.05f)
-                    st.weight = 1.0f;                      // a share of 0% would mean "don't fit at all"
-            });
-        }
-        else
-            wasReference = releaseReference (slot);        // a slot that was not the reference stays untouched
+        editSlotState (slot, [a, b] (SlotState& st) { st.trimStart = a; st.trimEnd = b; });
     }
-    if (isReference)
-        applyReferenceKey (slot);
-    else if (wasReference)
-        restoreKeyAfterReference();
-    updateFitFromSlots();
-    slotsVersion.fetch_add (1);
+    if (slotPreviewIndex.load() == slot)   // listening to it: follow the lines straight away
+    {
+        slotPreviewTrimStart = a;
+        slotPreviewTrimEnd = b;
+    }
+    if (slot == kTrackSlot)
+        trackRegrid = true;   // the worker re-measures the part you picked
+    slotsVersion.fetch_add (1);   // no re-preparing needed: the lines only steer where slices come from
     requestUpdate();
 }
 
@@ -2266,7 +2310,7 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
     juce::ValueTree slots ("SLOTS");
     {
         const juce::ScopedLock sl (slotLock);
-        for (int i = 0; i < kNumSlots; ++i)
+        for (int i = 0; i < kAllSlots; ++i)
         {
             const auto& a = slotAudio[(size_t) i];
             const auto& pend = pending[(size_t) i];
@@ -2288,8 +2332,8 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
             t.setProperty ("bpm", st.bpmOverride, nullptr);
             t.setProperty ("transpose", st.transpose, nullptr);
             t.setProperty ("weight", st.weight, nullptr);
-            t.setProperty ("reference", st.reference, nullptr);
-            t.setProperty ("weightBefore", st.weightBefore, nullptr);
+            t.setProperty ("trimStart", st.trimStart, nullptr);
+            t.setProperty ("trimEnd", st.trimEnd, nullptr);
             if (detected > 0.0)
                 t.setProperty ("detectedBpm", detected, nullptr);
             // name and key travel with the project, also to a computer where the path doesn't exist
@@ -2401,26 +2445,29 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
 
     // Slots: a slot that already holds exactly this audio is kept as it is (host A/B compare, preset
     // recall), others are loaded in the background while the old audio keeps playing until they are ready.
-    std::array<bool, kNumSlots> inState {};
-    bool haveReference = false;
+    std::array<bool, kAllSlots> inState {};
+    bool haveTrack = false;
     for (auto t : slots)
     {
-        const int i = t.getProperty ("index", -1);
-        if (! juce::isPositiveAndBelow (i, kNumSlots) || inState[(size_t) i])
+        int i = t.getProperty ("index", -1);
+        // projects from before the track slot existed: a sample marked "my track" moves into it
+        if ((bool) t.getProperty ("reference", false) && juce::isPositiveAndBelow (i, kNumSlots) && ! haveTrack)
+        {
+            i = kTrackSlot;
+            haveTrack = true;
+        }
+        if (! juce::isPositiveAndBelow (i, kAllSlots) || inState[(size_t) i])
             continue;
         inState[(size_t) i] = true;
+        haveTrack = haveTrack || i == kTrackSlot;
         SlotState st;
         st.enabled = t.getProperty ("enabled", true);
         st.bpmOverride = t.getProperty ("bpm", 0.0);
         st.transpose = t.getProperty ("transpose", 0);
         st.weight = juce::jlimit (0.0f, 2.0f, (float) (double) t.getProperty ("weight", 1.0));
-        st.reference = (bool) t.getProperty ("reference", false);
-        st.weightBefore = (float) (double) t.getProperty ("weightBefore", -1.0);
-        if (st.reference && st.weight < 0.05f)
-            st.weight = 1.0f;         // a share of 0% would mean "don't fit at all"
-        if (st.reference && haveReference)
-            st.reference = false;     // only one track at a time, whatever the file says
-        haveReference = haveReference || st.reference;
+        st.trimStart = juce::jlimit (0.0f, 1.0f, (float) (double) t.getProperty ("trimStart", 0.0));
+        st.trimEnd   = juce::jlimit (st.trimStart, 1.0f, (float) (double) t.getProperty ("trimEnd", 1.0));
+
         const juce::MemoryBlock* emb = t.getProperty ("audio").getBinaryData();
         const auto path = t.getProperty ("path").toString();
         const juce::File file = juce::File::isAbsolutePath (path) ? juce::File (path) : juce::File();
@@ -2438,12 +2485,14 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
         }
         if (same)
         {
+            if (i == kTrackSlot)
+                trackRegrid = true;   // same audio, but the lines or the tempo may have moved
             slotsVersion.fetch_add (1);
             continue;
         }
         queueLoad (i, file, emb, st, detected, t.getProperty ("name").toString(), (int) t.getProperty ("key", -2));
     }
-    for (int i = 0; i < kNumSlots; ++i)
+    for (int i = 0; i < kAllSlots; ++i)
         if (! inState[(size_t) i])
         {
             const auto info = getSlotInfo (i);
@@ -2506,16 +2555,8 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
 
     // ... but a slot that is marked as your own track still gets its key, so FIT keeps its promise.
     // Its audio is usually still loading, so this asks for the key and the worker applies it when ready.
-    if (sessionReload)
-    {
-        const juce::ScopedLock sl (slotLock);
-        for (int i = 0; i < kNumSlots; ++i)
-            if (slotState[(size_t) i].reference || (pending[(size_t) i].active && pending[(size_t) i].state.reference))
-            {
-                pendingReferenceKey = i;
-                break;
-            }
-    }
+    if (sessionReload && inState[(size_t) kTrackSlot])
+        pendingReferenceKey = kTrackSlot;
     updateFitFromSlots();
     requestUpdate();
 }

@@ -786,6 +786,8 @@ PreparedSlot engine::prepare (const SlotAudio& a, const SlotState& state, int ef
     p.withOctave = withOctave;
     p.mode = mode;
     p.weight = juce::jlimit (0.0f, 2.0f, state.weight);
+    p.trimStart = juce::jlimit (0.0f, 1.0f, state.trimStart);
+    p.trimEnd   = juce::jlimit (p.trimStart, 1.0f, state.trimEnd);
 
     if (a.original == nullptr)
         return p;
@@ -1167,8 +1169,8 @@ namespace
     }
 }
 
-std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNumSlots>& slots,
-                                              const std::array<bool, kNumSlots>& enabled,
+std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAllSlots>& slots,
+                                              const std::array<bool, kAllSlots>& enabled,
                                               const Settings& s, const Arrangement& arr,
                                               const std::vector<Hit>& hits, double hostBpm, double rate, int onlySlot)
 {
@@ -1334,11 +1336,23 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
             const auto& src = bufferOf (slotOut, octaveOn);
             const double bl = beatLenOf (slotOut, octaveOn);
             const double srcBeats = src.getNumSamples() / bl;
-            const double loopBeats = juce::jmax (1.0, std::floor (srcBeats + 0.05));
+            // the two lines on the slot: only this part of the sample is used
+            const double fa = juce::jlimit (0.0, 1.0, (double) ps.trimStart);
+            const double fb = juce::jlimit (fa, 1.0, (double) ps.trimEnd);
+            const bool   trimmed = fb - fa > 0.001 && (fb - fa) * srcBeats > 0.02 && (fa > 0.0005 || fb < 0.9995);
+            const double winStart = trimmed ? fa * srcBeats : 0.0;
+            const double winEnd   = trimmed ? fb * srcBeats : srcBeats;
+            // long enough to still land on the beat grid? then snap up, with a little tolerance so a
+            // line dragged just past a beat does not throw that whole beat away
+            const double onBeat = std::ceil (winStart - 0.15);
+            const double base = (trimmed && winEnd - winStart > 1.25 && onBeat < winEnd - 0.25)
+                                    ? juce::jmax (0.0, onBeat) : winStart;
+            const double winBeats = juce::jmax (0.05, winEnd - base);
+            const double loopBeats = juce::jmax (1.0, std::floor (winBeats + 0.05));
             const double startBeat = hit.startStep / 4.0;
             const double onsetScale = (octaveOn && ps.audioOctave != nullptr) ? ps.beatLenOctave / ps.beatLen : 1.0;
 
-            beatsOut = 0.0;
+            beatsOut = trimmed ? winStart : 0.0;
             if (srcBeats < 0.75)
                 return;   // one-shot: always from the start
 
@@ -1348,7 +1362,10 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
                 const double phaseInBeat = startBeat - std::floor (startBeat);
                 const int beatCount = juce::jmax (1, (int) loopBeats);
                 const int beatIndex = juce::jmin (beatCount - 1, (int) (posDraw * beatCount));
-                beatsOut = beatIndex + phaseInBeat;
+                beatsOut = base + beatIndex + phaseInBeat;
+                // a window shorter than a beat has no beats to lock to: spread over it instead
+                if (winEnd - base < 1.0 + phaseInBeat)
+                    beatsOut = base + posDraw * juce::jmax (0.0, winEnd - base);
                 if (s.sliceMode == 1 && ps.onsets.size() > 1)
                 {
                     const double window = 0.15;   // beats: snap to the nearest transient
@@ -1356,6 +1373,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
                     for (int o : ps.onsets)
                     {
                         const double ob = o * onsetScale / bl;
+                        if (ob < winStart - 1.0e-9 || ob > winEnd + 1.0e-9)
+                            continue;
                         const double d = std::abs (ob - beatsOut);
                         if (d < bestDist) { bestDist = d; snapped = ob; }
                     }
@@ -1364,15 +1383,26 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
             }
             else if (s.sliceMode == 1 && ps.onsets.size() > 1)
             {
-                const int o = ps.onsets[(size_t) juce::jmin ((int) ps.onsets.size() - 1, (int) (posDraw * ps.onsets.size()))];
-                beatsOut = o * onsetScale / bl;
+                std::vector<double> inWindow;
+                inWindow.reserve (ps.onsets.size());
+                for (int o : ps.onsets)
+                    if (const double ob = o * onsetScale / bl; ob >= winStart - 1.0e-9 && ob <= winEnd + 1.0e-9)
+                        inWindow.push_back (ob);
+                if (inWindow.empty())
+                    beatsOut = base;
+                else
+                    beatsOut = inWindow[(size_t) juce::jlimit (0, (int) inWindow.size() - 1, (int) (posDraw * inWindow.size()))];
             }
             else
             {
                 const double sliceBeats = juce::jmax (0.125, s.sliceSteps / 4.0);
                 const int numSlices = juce::jmax (1, (int) std::floor (loopBeats / sliceBeats + 1.0e-6));
-                beatsOut = juce::jmin (numSlices - 1, (int) (posDraw * numSlices)) * sliceBeats;
+                // a window smaller than one slice: start anywhere inside it instead of always at the end
+                beatsOut = winEnd - base < sliceBeats ? base + posDraw * juce::jmax (0.0, winEnd - base)
+                                                      : base + juce::jmin (numSlices - 1, (int) (posDraw * numSlices)) * sliceBeats;
             }
+            if (trimmed)
+                beatsOut = juce::jlimit (winStart, juce::jmax (winStart, winEnd - 0.001), beatsOut);
         };
 
         auto isSilent = [&] (int slotIdx, double beats, bool octaveOn)
@@ -2020,7 +2050,7 @@ double engine::scoreLoop (const RenderResult& r, double fillTargetScale)
     const double crest = peak / juce::jmax (1.0e-6, rmsAll);           // punch
 
     // 2. how well the slices are spread over the samples that are on
-    std::array<int, kNumSlots> perSlot {};
+    std::array<int, kAllSlots> perSlot {};
     for (const auto& sg : r.segments)
         if (juce::isPositiveAndBelow (sg.slot, kNumSlots))
             ++perSlot[(size_t) sg.slot];

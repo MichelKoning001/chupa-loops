@@ -21,6 +21,7 @@ struct SlotInfo
     double detectedBpm = 0, bpmOverride = 0;
     int transpose = 0;
     float weight = 1.0f;
+    float trimStart = 0.0f, trimEnd = 1.0f;
     bool reference = false;
     double stretchRatio = 1.0;
     std::vector<float> peaks;
@@ -85,9 +86,12 @@ public:
     void clearSlot (int slot);
     void setSlotEnabled (int slot, bool);
     void setSlotWeight (int slot, float weight);       // 0..2: share of the slices coming from this sample
-    /** FIT TO TRACK: mark a slot as "my track". It is not sliced; the new loop leaves room for it. */
-    void setSlotReference (int slot, bool isReference);
+    /** The two lines on a slot: slices are only taken from between them (0..1 of the sample). */
+    void setSlotTrim (int slot, float start, float end);
+    /** kTrackSlot when a part of your own track is loaded (FIT TO TRACK), otherwise -1. */
     int  getReferenceSlot() const noexcept { return referenceSlot.load(); }
+    /** Where the sample preview is playing, 0..1 of the whole sample (-1 = not playing). */
+    double getSlotPreviewPosition() const noexcept { return slotPreviewPos.load(); }
     /** Listen to one sample on its own (at its own tempo), looping. -1 = stop. */
     void setSlotPreview (int slot);
     int  getSlotPreview() const noexcept { return slotPreviewIndex.load(); }
@@ -213,15 +217,15 @@ private:
     static constexpr double maxEmbedSeconds = 64.0;
 
     mutable juce::CriticalSection slotLock;
-    std::array<SlotAudio, kNumSlots>    slotAudio;
-    std::array<SlotState, kNumSlots>    slotState;
-    std::array<PendingLoad, kNumSlots>  pending;
-    std::array<bool, kNumSlots>         slotMissing {};
-    std::array<juce::File, kNumSlots>   missingFile;
-    std::array<bool, kNumSlots>         slotError {};
-    std::array<int, kNumSlots>          slotGeneration {};
-    std::array<juce::MemoryBlock, kNumSlots> embeddedAudio;   // compressed copy kept for the project file
-    std::array<PreparedSlot, kNumSlots> prepared;             // worker thread only
+    std::array<SlotAudio, kAllSlots>    slotAudio;
+    std::array<SlotState, kAllSlots>    slotState;
+    std::array<PendingLoad, kAllSlots>  pending;
+    std::array<bool, kAllSlots>         slotMissing {};
+    std::array<juce::File, kAllSlots>   missingFile;
+    std::array<bool, kAllSlots>         slotError {};
+    std::array<int, kAllSlots>          slotGeneration {};
+    std::array<juce::MemoryBlock, kAllSlots> embeddedAudio;   // compressed copy kept for the project file
+    std::array<PreparedSlot, kAllSlots> prepared;             // worker thread only
     int nextLoadId = 1;
 
     mutable juce::CriticalSection arrangementLock;
@@ -260,15 +264,16 @@ private:
     juce::String jobMessage;
     ParamMap beforeCrazy, afterCrazy;     // guarded by jobLock
     std::atomic<bool> crazyActive { false };
-    void runAutoPick (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate, int candidates);
-    void runStems (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate);
+    void runAutoPick (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate, int candidates);
+    void runStems (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate);
     std::atomic<double> hostBpm { defaultBpm }, fallbackBpm { defaultBpm }, currentRate { 0.0 }, playPosition { -1.0 };
     std::atomic<bool> standaloneStateRestored { false };   // the standalone reloads its last session once
     std::atomic<bool> editorEverOpened { false };          // ... and it does that before the window exists
-    std::atomic<bool> keyRestoreWanted { false };
+    std::atomic<bool> keyRestoreWanted { false }, trackRegrid { false };
+    std::atomic<double> slotPreviewPos { -1.0 };
     void handleAsyncUpdate() override;
-    bool releaseReference (int slot);        // call with slotLock held
     void restoreKeyAfterReference();
+    void regridTrack();                      // worker thread
     /** Changes a slot's settings, also on a file that is still loading. Call with slotLock held. */
     template <typename Fn>
     void editSlotState (int slot, Fn&& fn)
@@ -319,6 +324,7 @@ private:
     mutable juce::SpinLock slotPreviewLock;
     std::shared_ptr<const juce::AudioBuffer<float>> slotPreviewAudio;   // guarded by slotPreviewLock
     std::atomic<double> slotPreviewRate { 44100.0 };
+    std::atomic<float> slotPreviewTrimStart { 0.0f }, slotPreviewTrimEnd { 1.0f };
     std::deque<std::shared_ptr<const juce::AudioBuffer<float>>> slotPreviewKeep;   // message thread: keeps old audio alive
     std::atomic<int> slotPreviewIndex { -1 }, slotPreviewVersion { 0 };
     std::shared_ptr<const juce::AudioBuffer<float>> slotPlaying;        // audio thread

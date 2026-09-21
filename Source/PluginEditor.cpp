@@ -81,7 +81,7 @@ MainView::MainView (SliceTribeProcessor& p)
 {
     wildcard = proc.getAudioWildcard();
 
-    for (int i = 0; i < kNumSlots; ++i)
+    for (int i = 0; i < kAllSlots; ++i)   // 8 sample slots plus the box for your own track
     {
         auto* s = slots.add (new SlotComponent (proc, i));
         s->onFilesDropped = [this] (int slot, const juce::StringArray& files) { distributeFiles (slot, files); };
@@ -233,7 +233,7 @@ MainView::MainView (SliceTribeProcessor& p)
     addAndMakeVisible (spliceButton);
 
     clearAllButton.setButtonText ("CLEAR ALL");
-    clearAllButton.setTooltip ("Empty all 8 slots (click twice)");
+    clearAllButton.setTooltip ("Empty all 8 slots and the track box (click twice)");
     clearAllButton.onClick = [this] { clearAllSlots(); };
     addAndMakeVisible (clearAllButton);
 
@@ -311,20 +311,24 @@ void MainView::startTour()
     tour.start ({
         { { 16, 102, 1088, 196 }, "1. Drop your loops",
           "Drop up to 8 loops here - basslines, synths, vocals, drums, any tempo and any key. Tempo and key are read from the file name, or from the audio itself. "
-          "The triangle listens to one sample on its own, the % says how often slices are taken from it." },
-        { { 16, 102, 263, 92 }, "2. FIT TO TRACK",
-          "Drop a part of YOUR OWN song into a slot and press FIT on it. That sample is never sliced: it is the track the new loop has to fit around. "
-          "Chupa Loops hears where your track is busy and leaves room there, and the key follows it. The % next to FIT says how hard it gets out of the way." },
+          "The triangle listens to one sample on its own, the % says how often slices are taken from it, and the two lines over the waveform pick the part you "
+          "want to use." },
+        { { 16, 520, 262, 92 }, "2. FIT TO TRACK",
+          "Drop a part of YOUR OWN song in this box. It is never sliced: it is the track the new loop has to fit around. Chupa Loops hears where your "
+          "track is busy and leaves room there, and the key follows it. The % says how hard the new loop stays out of your track's way, and the two "
+          "lines on the waveform pick the part it listens to." },
         { { 924, 520, 180, 60 }, "3. New loop",
           "Every click builds a brand new loop from slices out of all your loops. Not a chopped-up copy: a new groove." },
         { { 16, 310, 1088, 198 }, "4. Shape it",
           "Click a slice to swap it for another, right-click to lock it. AUTO PICK makes eight loops and keeps the best, KEEP parks a loop in a scene. "
           "In the panel on the right: MUTATE for a variation, RHY for another rhythm, SRC for other sounds." },
-        { { 16, 520, 540, 264 }, "5. Rhythm and length",
-          "Pick the rhythm the slices are placed on, the length (1 to 32 bars), a FILL at the end of every phrase, and TIME FEEL for half or double speed." },
-        { { 384, 66, 354, 32 }, "6. Scenes",
+        { { 16, 620, 262, 164 }, "5. Rhythm",
+          "Pick the rhythm the slices are placed on, and a FILL: the last half bar of every 4, 8, 16 or 32 bars becomes a roll, like a drummer's fill." },
+        { { 290, 520, 266, 264 }, "6. Length and slicing",
+          "The length of the loop (1 to 32 bars), how often a motif repeats, how the slices are cut, and TIME FEEL for half or double speed." },
+        { { 384, 66, 354, 32 }, "7. Scenes",
           "Store your favourite loops in scenes A to H and switch between them while you play (MIDI C4 to G4)." },
-        { { 924, 716, 180, 62 }, "7. Into your song",
+        { { 924, 716, 180, 62 }, "8. Into your song",
           "Drag the loop out as WAV, or as MIDI: with MIDI NOTES set to Slices every note plays one slice (C1 = the whole loop). The FX tab gives it the finishing touch." },
     });
 }
@@ -417,7 +421,7 @@ void MainView::paint (juce::Graphics& g)
     }
 
     // samples toolbar (drawn straight on the background)
-    const juce::String hint ("Drop up to 8 loops - your own track too (FIT).");
+    const juce::String hint ("Drop up to 8 loops - any tempo, any key.");
     if (s.sticker)
     {
         // candy skins: a title chip and dark pills, so the text stays readable on the loud background
@@ -468,7 +472,7 @@ void MainView::paint (juce::Graphics& g)
     }
 
     // panels
-    drawPanel (g, { 16, 520, 262, 264 }, "Rhythm");
+    drawPanel (g, { 16, 620, 262, 164 }, "Rhythm");
     drawPanel (g, { 290, 520, 266, 264 }, "Loop & slicing");
     drawPanel (g, { 568, 520, 344, 264 }, {});
     drawPanel (g, { 924, 520, 180, 264 }, {});
@@ -477,7 +481,7 @@ void MainView::paint (juce::Graphics& g)
     g.setColour (colours::label());
     g.setFont (uiFont (11.0f, 1));
     const float lx = 304;
-    g.drawText ("FILL (EVERY ... BARS)", juce::Rectangle<float> (30, 730, 234, 14), juce::Justification::centredLeft);
+    g.drawText ("FILL (EVERY ... BARS)", juce::Rectangle<float> (24, 742, 246, 14), juce::Justification::centredLeft);
     g.drawText ("LENGTH (BARS)", juce::Rectangle<float> (lx, 549, 240, 13), juce::Justification::centredLeft);
     g.drawText ("REPEAT",        juce::Rectangle<float> (lx, 588, 240, 13), juce::Justification::centredLeft);
     g.drawText ("SLICE MODE",    juce::Rectangle<float> (lx, 627, 120, 13), juce::Justification::centredLeft);
@@ -514,18 +518,19 @@ void MainView::resized()
     for (int i = 0; i < sceneButtons.size(); ++i)
         sceneButtons[i]->setBounds (466 + i * 34, 69, 30, 26);
 
-    // slots: 4 x 2
+    // slots: 4 x 2, and your own track in the left column below the result
     const int sx = 16, sy = 102, gap = 12, sw = (designWidth - 32 - 3 * gap) / 4, sh = 92;
     for (int i = 0; i < kNumSlots; ++i)
         slots[i]->setBounds (sx + (i % 4) * (sw + gap), sy + (i / 4) * (sh + gap), sw, sh);
+    slots[kTrackSlot]->setBounds (16, 520, 262, 92);
 
     resultView.setBounds (16, 310, designWidth - 32, 198);
     autoPickButton.setBounds (100, 316, 88, 20);
     keepButton.setBounds     (194, 316, 54, 20);
 
-    // rhythm
-    patternSel.setBounds (30, 556, 234, 166);
-    fillSel.setBounds    (30, 746, 234, 26);
+    // rhythm (the panel starts below the track box)
+    patternSel.setBounds (24, 652, 246, 86);
+    fillSel.setBounds    (24, 758, 246, 22);
 
     // loop & slicing
     lengthSel.setBounds   (304, 562, 238, 22);
@@ -641,7 +646,7 @@ void MainView::clearAllSlots()
     }
     clearConfirmTicks = 0;
     clearAllButton.setButtonText ("CLEAR ALL");
-    for (int i = 0; i < kNumSlots; ++i)
+    for (int i = 0; i < kAllSlots; ++i)
         proc.clearSlot (i);
 }
 
@@ -703,6 +708,17 @@ void MainView::filesDropped (const juce::StringArray& files, int, int)
 void MainView::distributeFiles (int startSlot, const juce::StringArray& files)
 {
     juce::StringArray audio;
+    if (startSlot == kTrackSlot)   // the track box takes one file, it never spills into the sample slots
+    {
+        for (auto& f : files)
+            if (acceptsFile (f))
+            {
+                proc.loadSlot (kTrackSlot, juce::File (f));
+                return;
+            }
+        flash ("Unsupported file type - use WAV, AIFF, FLAC, MP3 or OGG", colours::error());
+        return;
+    }
     int rejected = 0;
     for (auto& f : files)
     {
@@ -839,10 +855,11 @@ void MainView::refreshSlots()
 {
     loadedCount = 0;
     const int previewing = proc.getSlotPreview();
-    for (int i = 0; i < kNumSlots; ++i)
+    for (int i = 0; i < kAllSlots; ++i)
     {
         auto info = proc.getSlotInfo (i);
-        loadedCount += info.loaded ? 1 : 0;
+        if (i < kNumSlots)
+            loadedCount += info.loaded ? 1 : 0;
         slots[i]->refresh (info);
         slots[i]->setPreviewing (i == previewing);
     }
@@ -873,8 +890,9 @@ void MainView::updateState()
         previewButton.setButtonText (playText);
 
     const bool hasLoop = proc.hasLoop();
-    const int sliceable = loadedCount - (proc.getReferenceSlot() >= 0 ? 1 : 0);   // your own track is not sliced
+    const int sliceable = loadedCount;   // loadedCount already leaves your own track out
     resultView.setOnlyReferenceLoaded (sliceable <= 0 && proc.getReferenceSlot() >= 0);
+    trackLoaded = proc.getReferenceSlot() >= 0;
     generateButton.setEnabled (sliceable > 0);
     crazyButton.setEnabled (sliceable > 0);
     mutateButton.setEnabled (hasLoop);
@@ -889,7 +907,7 @@ void MainView::updateState()
     exportButton.setEnabled (hasLoop);
     dragOut.setEnabled (hasLoop);
     previewButton.setEnabled (hasLoop || prev);
-    clearAllButton.setEnabled (loadedCount > 0 || clearConfirmTicks > 0);
+    clearAllButton.setEnabled (loadedCount > 0 || trackLoaded || clearConfirmTicks > 0);
     const int locks = proc.getLockedCount();
     unlockButton.setEnabled (locks > 0);
     const juce::String unlockText = locks > 0 ? "UNLOCK ALL (" + juce::String (locks) + ")" : juce::String ("UNLOCK ALL");
@@ -967,9 +985,11 @@ void MainView::timerCallback()
     if (proc.getSlotPreview() != lastSlotPreview)
     {
         lastSlotPreview = proc.getSlotPreview();
-        for (int i = 0; i < kNumSlots; ++i)
+        for (int i = 0; i < kAllSlots; ++i)
             slots[i]->setPreviewing (i == lastSlotPreview);
     }
+    if (const int pv = proc.getSlotPreview(); pv >= 0 && pv < slots.size())
+        slots[pv]->setPreviewPosition (proc.getSlotPreviewPosition());
 
     if (proc.getScenesVersion() != lastScenes)
     {

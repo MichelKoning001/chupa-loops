@@ -190,16 +190,31 @@ public:
     std::function<void (int slot, const juce::StringArray&)> onFilesDropped;
     std::function<bool (const juce::String&)> acceptsFile;
 
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    /** Playhead of the sample preview, 0..1 of the whole sample (<0 = none). */
+    void setPreviewPosition (double p);
+
 private:
     void openFileChooser();
+    bool isTrack() const noexcept { return index == kTrackSlot; }
+    juce::String defaultTip() const;
+    juce::Rectangle<float> waveArea() const;
+    int handleAt (juce::Point<float>) const;      // 0 = start line, 1 = end line, -1 = none
+    void applyTrim (float start, float end, bool finished);
 
     SliceTribeProcessor& proc;
     int index;
     SlotInfo info;
     bool dragOver = false, previewing = false;
+    int dragHandle = -1, hoverHandle = -1;
+    float trimA = 0.0f, trimB = 1.0f;             // what the UI shows while you drag
+    double previewPos = -1.0;
 
     DragNumber bpmField, transposeField, weightField;
-    juce::TextButton powerButton, clearButton, playButton, fitButton;
+    juce::TextButton powerButton, clearButton, playButton;
     std::unique_ptr<juce::FileChooser> chooser;
 };
 

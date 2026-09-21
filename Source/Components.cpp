@@ -610,29 +610,41 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     weightField.format = [] (double v) { return juce::String ((int) v) + "%"; };
     weightField.onDragEnd = [this] (double v) { proc.setSlotWeight (index, (float) (v / 100.0)); };
     weightField.onReset = [this] { proc.setSlotWeight (index, 1.0f); };
-    weightField.setTooltip ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%.");
+    weightField.setTooltip (isTrack()
+        ? juce::String ("FIT: how hard the new loop stays out of your track's way.\n0% = not at all, 100% = normal, 200% = really out of the way.\nDrag up/down, double-click = 100%.")
+        : juce::String ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%."));
     addAndMakeVisible (weightField);
 
-    fitButton.setButtonText ("FIT");
-    fitButton.setClickingTogglesState (false);
-    fitButton.setTooltip ("FIT TO TRACK: this is a part of YOUR OWN track.\n"
-                          "It is never sliced - the new loop leaves room where your track is busy, and KEY follows this sample.\n"
-                          "The % next to it says how hard the new loop stays out of the way.\n"
-                          "Click again to turn it off: the % is a normal share again and KEY goes back to what you had.");
-    fitButton.onClick = [this] { proc.setSlotReference (index, ! info.reference); };
-    addAndMakeVisible (fitButton);
-
     playButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb6"));
-    playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping).\nClick again to stop.");
+    playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping) - only the part between the two lines.\nClick again to stop.");
     playButton.onClick = [this] { proc.setSlotPreview (index); };
     addAndMakeVisible (playButton);
 
     clearButton.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));
     clearButton.setTooltip ("Clear slot");
+    if (index == kTrackSlot)
+        clearButton.setTooltip ("Remove your track: fitting goes off and KEY goes back to what you had");
     clearButton.onClick = [this] { proc.clearSlot (index); };
     addAndMakeVisible (clearButton);
 
-    setTooltip ("Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\nA part of your own song goes here too - press FIT on the slot afterwards.");
+    if (isTrack())
+    {
+        powerButton.setVisible (false);
+        transposeField.setVisible (false);
+        playButton.setTooltip ("Listen to the part between the two lines, looping. Click again to stop.");
+        bpmField.setTooltip ("Tempo of your track. The fit grid is built on this, so correct it here if it is wrong.\n"
+                             "Drag up/down (Shift = fine), double-click = automatic.");
+    }
+    setTooltip (defaultTip());
+}
+
+juce::String SlotComponent::defaultTip() const
+{
+    if (isTrack())
+        return "Drop a part of your own song here (from Finder/Explorer or your DAW) or click to browse.\n"
+               "It is never sliced: the new loop leaves room where your track is busy, and KEY follows it.";
+    return "Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\n"
+           "Drag the two lines over the waveform to use only a part of it.";
 }
 
 void SlotComponent::refresh (const SlotInfo& i)
@@ -640,29 +652,32 @@ void SlotComponent::refresh (const SlotInfo& i)
     info = i;
     const bool show = info.loaded;
     bpmField.setVisible (show);
-    transposeField.setVisible (show);
-    powerButton.setVisible (show);
+    powerButton.setVisible (show && ! isTrack());
+    transposeField.setVisible (show && ! isTrack());
     playButton.setVisible (show);
-    fitButton.setVisible (show);
-    fitButton.setToggleState (info.reference, juce::dontSendNotification);
     weightField.setVisible (show);
+    if (dragHandle < 0)
+    {
+        trimA = juce::jlimit (0.0f, 0.99f, info.trimStart);
+        trimB = juce::jlimit (trimA, 1.0f, info.trimEnd);
+    }
     weightField.setValue (juce::roundToInt (info.weight * 100.0f));
-    weightField.highlighted = info.reference || std::abs (info.weight - 1.0f) > 0.01f;
-    weightField.setTooltip (info.reference
+    weightField.highlighted = isTrack() || std::abs (info.weight - 1.0f) > 0.01f;
+    weightField.setTooltip (isTrack()
         ? juce::String ("FIT: how hard the new loop stays out of your track's way.\n0% = not at all, 100% = normal, 200% = really out of the way.\nDrag up/down, double-click = 100%.")
         : juce::String ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%."));
-    weightField.colour = info.reference ? colours::cyan() : colours::slot (index);   // it is the FIT amount now
+    weightField.colour = isTrack() ? colours::cyan() : colours::slot (index);
     clearButton.setVisible (show || info.missing || info.error);
     powerButton.setToggleState (info.enabled, juce::dontSendNotification);
     powerButton.setButtonText (info.enabled ? "ON" : "OFF");
     bpmField.setValue (info.bpmOverride > 0 ? info.bpmOverride : info.detectedBpm);
     bpmField.highlighted = info.bpmOverride > 0;
-    bpmField.colour = colours::slot (index);
+    bpmField.colour = isTrack() ? colours::cyan() : colours::slot (index);
     transposeField.setValue (info.transpose);
     transposeField.highlighted = info.transpose != 0;
     transposeField.colour = colours::slot (index);
 
-    juce::String tip = "Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\nA part of your own song goes here too - press FIT on the slot afterwards.";
+    juce::String tip = defaultTip();
     if (info.loaded)
     {
         const double src = info.bpmOverride > 0 ? info.bpmOverride : info.detectedBpm;
@@ -674,9 +689,9 @@ void SlotComponent::refresh (const SlotInfo& i)
         tip = "The file was moved or deleted. Click to locate it, or drop the file here.";
     else if (info.error)
         tip = "This file can't be read. Use WAV, AIFF, FLAC, MP3 or OGG.";
-    if (info.reference)
-        tip = info.name + "\nMY TRACK: this sample is never sliced. The new loop leaves room where your track is busy,\n"
-                          "and the key follows it. Press FIT again to turn it off.";
+    if (isTrack() && info.loaded)
+        tip = info.name + "\nMY TRACK: this one is never sliced. The new loop leaves room where your track is busy,\n"
+                          "and KEY follows it. Drag the two lines to pick the part it listens to.";
     setTooltip (tip);
     repaint();
 }
@@ -693,10 +708,18 @@ void SlotComponent::setPreviewing (bool p)
 void SlotComponent::resized()
 {
     auto r = getLocalBounds().reduced (10, 8);
-    r.removeFromLeft (26);
+    r.removeFromLeft (isTrack() ? 8 : 26);
     auto bottom = r.removeFromBottom (22);
     playButton.setBounds (bottom.removeFromLeft (30));
     bottom.removeFromLeft (6);
+    if (isTrack())
+    {
+        weightField.setBounds (bottom.removeFromRight (62));
+        bottom.removeFromRight (6);
+        bpmField.setBounds (bottom.removeFromRight (74));
+        clearButton.setBounds (getWidth() - 28, 8, 20, 20);
+        return;
+    }
     powerButton.setBounds (bottom.removeFromRight (44));
     bottom.removeFromRight (6);
     transposeField.setBounds (bottom.removeFromRight (50));
@@ -704,30 +727,107 @@ void SlotComponent::resized()
     bpmField.setBounds (bottom.removeFromRight (74));
     clearButton.setBounds (getWidth() - 30, 8, 20, 20);
     weightField.setBounds (getWidth() - 82, 8, 46, 20);
-    fitButton.setBounds   (getWidth() - 118, 8, 32, 20);
+}
+
+/** The strip the waveform is drawn in: where the two cut lines live. */
+juce::Rectangle<float> SlotComponent::waveArea() const
+{
+    auto r = getLocalBounds().toFloat().reduced (0.5f);
+    r.removeFromLeft (isTrack() ? 8.0f : 26.0f);
+    auto content = r.reduced (10.0f, 8.0f);
+    content.removeFromTop (18.0f);
+    return content.withTrimmedBottom (26.0f).withTrimmedTop (4.0f);
+}
+
+int SlotComponent::handleAt (juce::Point<float> p) const
+{
+    if (! info.loaded)
+        return -1;
+    auto w = waveArea();
+    if (! w.expanded (0.0f, 6.0f).contains (p))
+        return -1;
+    const float xa = w.getX() + trimA * w.getWidth();
+    const float xb = w.getX() + trimB * w.getWidth();
+    const float da = std::abs (p.x - xa), db = std::abs (p.x - xb);
+    if (juce::jmin (da, db) > 7.0f)
+        return -1;
+    return da <= db ? 0 : 1;
+}
+
+void SlotComponent::applyTrim (float a, float b, bool finished)
+{
+    trimA = juce::jlimit (0.0f, 0.99f, a);
+    trimB = juce::jlimit (juce::jmin (1.0f, trimA + 0.01f), 1.0f, b);
+    proc.setSlotTrim (index, trimA, trimB);
+    repaint();
+    juce::ignoreUnused (finished);
+}
+
+void SlotComponent::mouseDown (const juce::MouseEvent& e)
+{
+    dragHandle = e.mods.isPopupMenu() ? -1 : handleAt (e.position);
+}
+
+void SlotComponent::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragHandle < 0)
+        return;
+    auto w = waveArea();
+    const float f = juce::jlimit (0.0f, 1.0f, (e.position.x - w.getX()) / juce::jmax (1.0f, w.getWidth()));
+    if (dragHandle == 0) applyTrim (juce::jmin (f, trimB - 0.01f), trimB, false);
+    else                 applyTrim (trimA, juce::jmax (f, trimA + 0.01f), false);
+}
+
+void SlotComponent::mouseMove (const juce::MouseEvent& e)
+{
+    const int h = handleAt (e.position);
+    if (h != hoverHandle)
+    {
+        hoverHandle = h;
+        setMouseCursor (h >= 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+        repaint();
+    }
+}
+
+void SlotComponent::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    if (info.loaded && waveArea().expanded (0.0f, 6.0f).contains (e.position))
+        applyTrim (0.0f, 1.0f, true);   // the whole sample again
+}
+
+void SlotComponent::setPreviewPosition (double p)
+{
+    if (std::abs (p - previewPos) < 1.0e-4)
+        return;
+    previewPos = p;
+    repaint (waveArea().expanded (2.0f, 6.0f).toNearestInt());
 }
 
 void SlotComponent::paint (juce::Graphics& g)
 {
-    const auto col = colours::slot (index);
+    const auto col = isTrack() ? colours::cyan() : colours::slot (index);
     auto r = getLocalBounds().toFloat().reduced (0.5f);
     const bool active = info.loaded && info.enabled;
     const bool hover = isMouseOver (true);
 
     g.setColour (dragOver ? colours::raised() : colours::panel2());
     g.fillRoundedRectangle (r, 9.0f);
-    g.setColour (dragOver ? col : (hover ? colours::outline().brighter (0.3f) : colours::outline()));
+    g.setColour (dragOver ? col : isTrack() ? col.withAlpha (info.loaded ? 0.9f : 0.55f)
+                                            : (hover ? colours::outline().brighter (0.3f) : colours::outline()));
     g.drawRoundedRectangle (r, 9.0f, dragOver ? 2.0f : 1.0f);
 
-    auto stripe = r.removeFromLeft (26.0f);
+    auto stripe = r.removeFromLeft (isTrack() ? 8.0f : 26.0f);
     {
         juce::Path p;
         p.addRoundedRectangle (stripe.getX(), stripe.getY(), stripe.getWidth(), stripe.getHeight(), 9.0f, 9.0f, true, false, true, false);
-        g.setColour (col.withAlpha (active ? 0.95f : 0.22f));
+        g.setColour (col.withAlpha (active || isTrack() ? 0.95f : 0.22f));
         g.fillPath (p);
-        g.setColour (active ? juce::Colours::black.withAlpha (0.75f) : colours::text().withAlpha (0.55f));
-        g.setFont (uiFont (14.0f, 2));
-        g.drawText (juce::String (index + 1), stripe, juce::Justification::centred);
+        if (! isTrack())
+        {
+            g.setColour (active ? juce::Colours::black.withAlpha (0.75f) : colours::text().withAlpha (0.55f));
+            g.setFont (uiFont (14.0f, 2));
+            g.drawText (juce::String (index + 1), stripe, juce::Justification::centred);
+        }
     }
 
     auto content = r.reduced (10.0f, 8.0f);
@@ -736,25 +836,28 @@ void SlotComponent::paint (juce::Graphics& g)
     if (! info.loaded)
     {
         const bool problem = info.missing || info.error;
-        g.setColour (problem ? colours::error() : (dragOver ? col : (hover ? colours::text() : colours::dim())));
-        g.setFont (uiFont (13.0f, 1));
+        g.setColour (problem ? colours::error() : (dragOver ? col : isTrack() ? col : (hover ? colours::text() : colours::dim())));
+        g.setFont (uiFont (isTrack() ? 12.5f : 13.0f, isTrack() ? 2 : 1));
         juce::String text = info.loading ? "Loading..."
                           : info.error ? "Can't read this file"
                           : info.missing ? "File not found"
-                          : dragOver ? "Release to load" : "Drop sample here";
+                          : dragOver ? "Release to load"
+                          : isTrack() ? "DROP YOUR OWN TRACK HERE" : "Drop sample here";
         g.drawText (text, content.withTrimmedTop (-18.0f).withTrimmedBottom (4.0f), juce::Justification::centred);
         if (! info.loading && ! dragOver)
         {
             g.setColour (colours::label());
             g.setFont (uiFont (11.5f));
-            const juce::String sub = problem ? info.name + (info.missing ? "  -  click to locate" : "") : juce::String ("or click to browse");
+            const juce::String sub = problem ? info.name + (info.missing ? "  -  click to locate" : "")
+                                   : isTrack() ? juce::String ("the new loop then fits around it")
+                                               : juce::String ("or click to browse");
             g.drawFittedText (sub, content.withTrimmedTop (18.0f).toNearestInt(), juce::Justification::centred, 1);
         }
         return;
     }
 
     // title row: name ... [key] [+x%]
-    auto tags = title.withTrimmedRight (112.0f);   // room for the FIT button, the share field and the clear button
+    auto tags = title.withTrimmedRight (isTrack() ? 28.0f : 112.0f);   // room for the fields and the clear button
     auto drawTag = [&] (const juce::String& t, juce::Colour c)
     {
         const float w = juce::GlyphArrangement::getStringWidth (uiFont (10.5f, 1), t) + 10.0f;
@@ -776,11 +879,26 @@ void SlotComponent::paint (juce::Graphics& g)
                  info.keyShift != 0 ? colours::cyan() : colours::dim());
     }
 
+    if (isTrack())
+    {
+        const auto f = uiFont (10.0f, 2);
+        const float w = juce::GlyphArrangement::getStringWidth (f, "MY TRACK") + 12.0f;
+        auto tag = tags.removeFromLeft (w).withSizeKeepingCentre (w, 16.0f);
+        tags.removeFromLeft (8.0f);
+        g.setColour (col.withAlpha (skin().light ? 0.20f : 0.16f));
+        g.fillRoundedRectangle (tag, 4.0f);
+        g.setColour (skin().light ? col.darker (0.3f) : col);
+        g.setFont (f);
+        g.drawText ("MY TRACK", tag, juce::Justification::centred);
+    }
     g.setColour (active ? colours::text() : colours::faint());
     g.setFont (uiFont (12.5f, 1));
     g.drawFittedText (info.name, tags.toNearestInt(), juce::Justification::centredLeft, 1, 0.9f);
 
-    auto wave = content.withTrimmedBottom (26.0f).withTrimmedTop (4.0f);
+    auto wave = waveArea();
+    const float xa = wave.getX() + trimA * wave.getWidth();
+    const float xb = wave.getX() + trimB * wave.getWidth();
+    const bool cut = trimA > 0.001f || trimB < 0.999f;
     if (! info.peaks.empty() && wave.getHeight() > 4)
     {
         const int n = (int) info.peaks.size() / 2;
@@ -789,29 +907,37 @@ void SlotComponent::paint (juce::Graphics& g)
         float maxAbs = 0.001f;
         for (auto v : info.peaks) maxAbs = juce::jmax (maxAbs, std::abs (v));
         const float scale = 0.85f / maxAbs;
-        g.setColour (col.withAlpha (active ? 0.85f : 0.25f));
         const int cols = (int) wave.getWidth();
         for (int x = 0; x < cols; ++x)
         {
+            const float px = wave.getX() + x;
+            const bool outside = cut && (px < xa - 0.5f || px > xb + 0.5f);
+            g.setColour (col.withAlpha (outside ? 0.13f : (active ? 0.85f : 0.25f)));
             const int p = x * n / juce::jmax (1, cols);
             const float mn = info.peaks[(size_t) p * 2] * scale, mx = info.peaks[(size_t) p * 2 + 1] * scale;
-            g.fillRect (wave.getX() + x, mid - mx * half, 1.0f, juce::jmax (1.0f, (mx - mn) * half));
+            g.fillRect (px, mid - mx * half, 1.0f, juce::jmax (1.0f, (mx - mn) * half));
         }
     }
 
-    // "my track" is the one thing you must be able to see at a glance, so it gets a badge of its own
-    if (info.reference && wave.getHeight() > 10)
+    // the playhead of the sample preview
+    if (previewing && previewPos >= 0.0 && wave.getHeight() > 4)
     {
-        const auto f = uiFont (10.5f, 2);
-        const juce::String t ("MY TRACK");
-        auto pill = wave.withSizeKeepingCentre (juce::GlyphArrangement::getStringWidth (f, t) + 14.0f, 17.0f)
-                        .withX (wave.getX());
-        g.setColour (colours::panel2().withAlpha (0.92f));
-        g.fillRoundedRectangle (pill, 4.0f);
-        g.setColour (colours::cyan());
-        g.drawRoundedRectangle (pill.reduced (0.5f), 4.0f, 1.0f);
-        g.setFont (f);
-        g.drawText (t, pill, juce::Justification::centred);
+        const float px = wave.getX() + (float) previewPos * wave.getWidth();
+        g.setColour (colours::text().withAlpha (0.85f));
+        g.fillRect (px, wave.getY() - 2.0f, 1.0f, wave.getHeight() + 4.0f);
+    }
+
+    // the two cut lines: only the part between them is used
+    if (info.loaded && wave.getHeight() > 4)
+    {
+        for (int h = 0; h < 2; ++h)
+        {
+            const float x = h == 0 ? xa : xb;
+            const bool hot = hoverHandle == h || dragHandle == h;
+            g.setColour (colours::cyan().withAlpha (hot ? 1.0f : cut ? 0.9f : hover ? 0.5f : 0.22f));
+            g.fillRect (x - (hot ? 1.0f : 0.5f), wave.getY() - 3.0f, hot ? 2.0f : 1.0f, wave.getHeight() + 6.0f);
+            g.fillRoundedRectangle (x - 3.0f, wave.getY() - 6.0f, 6.0f, 6.0f, 1.5f);
+        }
     }
 }
 
@@ -820,30 +946,37 @@ void SlotComponent::paintOverChildren (juce::Graphics& g)
     if (info.loaded && info.loading)   // a new file is replacing this one
     {
         g.setColour (colours::panel2().withAlpha (0.88f));
-        g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f).withTrimmedLeft (26.0f), 8.0f);
+        g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f).withTrimmedLeft (isTrack() ? 8.0f : 26.0f), 8.0f);
         g.setColour (colours::cyan());
         g.setFont (uiFont (13.0f, 1));
-        g.drawText ("Loading...", getLocalBounds().withTrimmedLeft (26), juce::Justification::centred);
+        g.drawText ("Loading...", getLocalBounds().withTrimmedLeft (isTrack() ? 8 : 26), juce::Justification::centred);
     }
 }
 
 void SlotComponent::mouseUp (const juce::MouseEvent& e)
 {
-    if (! e.mouseWasClicked())
+    const bool wasDragging = dragHandle >= 0;
+    if (wasDragging)
+    {
+        applyTrim (trimA, trimB, true);
+        dragHandle = -1;
+    }
+    if (! e.mouseWasClicked() || wasDragging)
         return;
     if (e.mods.isPopupMenu() && (info.loaded || info.loading))
     {
         juce::PopupMenu m;
-        m.addSectionHeader (info.name.isNotEmpty() ? info.name.toUpperCase() : juce::String ("SAMPLE"));
-        m.addItem (1, "Use as my track (FIT TO TRACK)", true, info.reference);
-        m.addItem (2, "Listen to this sample", true, proc.getSlotPreview() == index);
-        m.addItem (3, "Clear slot");
+        m.addSectionHeader (info.name.isNotEmpty() ? info.name.toUpperCase()
+                                                   : juce::String (isTrack() ? "MY TRACK" : "SAMPLE"));
+        m.addItem (1, "Listen to it", true, proc.getSlotPreview() == index);
+        m.addItem (2, "Use the whole sample again", trimA > 0.001f || trimB < 0.999f);
+        m.addItem (3, isTrack() ? "Remove my track" : "Clear slot");
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
                          [safe = juce::Component::SafePointer<SlotComponent> (this)] (int r)
         {
             if (safe == nullptr) return;
-            if (r == 1) safe->proc.setSlotReference (safe->index, ! safe->info.reference);
-            if (r == 2) safe->proc.setSlotPreview (safe->index);
+            if (r == 1) safe->proc.setSlotPreview (safe->index);
+            if (r == 2) safe->applyTrim (0.0f, 1.0f, true);
             if (r == 3) safe->proc.clearSlot (safe->index);
         });
         return;
@@ -856,7 +989,9 @@ void SlotComponent::openFileChooser()
 {
     const auto start = info.missing && info.path.isNotEmpty() ? juce::File (info.path).getParentDirectory()
                                                                : juce::File::getSpecialLocation (juce::File::userMusicDirectory);
-    chooser = std::make_unique<juce::FileChooser> ("Choose sample(s) for slot " + juce::String (index + 1), start, proc.getAudioWildcard());
+    chooser = std::make_unique<juce::FileChooser> (isTrack() ? juce::String ("Choose a part of your own track")
+                                                             : "Choose sample(s) for slot " + juce::String (index + 1),
+                                                   start, proc.getAudioWildcard());
     chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
                               | juce::FileBrowserComponent::canSelectMultipleItems,
                           [this] (const juce::FileChooser& fc)
@@ -1066,15 +1201,15 @@ void ResultView::paint (juce::Graphics& g)
         auto t = area.withTrimmedLeft (m.getRight() - area.getX() + 24.0f);
         g.setColour (colours::screenText());
         g.setFont (uiFont (17.0f, 1));
-        g.drawText (onlyReference ? "That one is your track!" : "Feed me loops!",
+        g.drawText (onlyReference ? "Now the loops!" : "Feed me loops!",
                     t.withTrimmedBottom (40), juce::Justification::centredLeft);
         g.setColour (colours::screenText().withAlpha (0.72f));
         g.setFont (uiFont (12.5f));
         if (onlyReference)
         {
-            g.drawText ("A sample marked with FIT is never sliced - it is what the new loop has to fit around.",
+            g.drawText ("Your own track is in the box below - that one is never sliced, it is what the loop fits around.",
                         t.withTrimmedTop (4), juce::Justification::centredLeft);
-            g.drawText ("Drop a loop or two in the other slots to build from, or press FIT again to turn it off.",
+            g.drawText ("Drop a loop or two in the slots above to build from.",
                         t.withTrimmedTop (44), juce::Justification::centredLeft);
             return;
         }
@@ -1082,7 +1217,7 @@ void ResultView::paint (juce::Graphics& g)
                     t.withTrimmedTop (4), juce::Justification::centredLeft);
         g.drawText ("Then hit NEW LOOP until you love it.", t.withTrimmedTop (44), juce::Justification::centredLeft);
         g.setColour (colours::cyan());
-        g.drawText ("Drop a part of your own track in too and press FIT on that slot - the loop then fits around it.",
+        g.drawText ("Working on a song? Drop a part of it in the MY TRACK box below - the loop then fits around it.",
                     t.withTrimmedTop (84), juce::Justification::centredLeft);
         return;
     }

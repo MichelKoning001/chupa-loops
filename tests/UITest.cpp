@@ -620,17 +620,19 @@ int main (int argc, char** argv)
 
                 auto refFile = out.getChildFile ("MyTrack_140.wav");
                 engine::writeWav (refFile, kicks, rate, 1.0f);
-                proc->loadSlot (7, refFile);
-                waitFor (*proc, proc->getResultVersion() + 1, 30000);
                 setParam ("pattern", 4);     // Rolling 16th: hits on every step, so fit has something to skip
                 waitFor (*proc, proc->getResultVersion() + 1, 30000);
                 auto withoutFit = proc->getDisplayResult();
-                proc->setSlotReference (7, true);
-                CHECK (waitFor (*proc, proc->getResultVersion() + 1, 30000), "re-render with a reference track");
-                CHECK (proc->getReferenceSlot() == 7 && proc->getSlotInfo (7).reference, "slot 8 is the reference track");
+                const int vNoFit = proc->getResultVersion();
+                proc->loadSlot (kTrackSlot, refFile);
+                for (int t = 0; t < 100 && proc->getReferenceSlot() < 0; ++t)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+                CHECK (waitFor (*proc, vNoFit + 1, 30000), "re-render with your own track loaded");
+                CHECK (proc->getReferenceSlot() == kTrackSlot && proc->getSlotInfo (kTrackSlot).reference,
+                       "a sample in the track box is your own track");
                 auto withFit = proc->getDisplayResult();
                 int fromRef = 0;
-                for (const auto& sg : withFit->segments) fromRef += sg.slot == 7 ? 1 : 0;
+                for (const auto& sg : withFit->segments) fromRef += sg.slot == kTrackSlot ? 1 : 0;
                 CHECK (fromRef == 0, "no slices are taken from your own track");
 
                 auto onBeatShare = [] (const RenderResult& r)
@@ -697,14 +699,13 @@ int main (int argc, char** argv)
                     }
                 }
 
-                proc->setSlotWeight (7, 0.0f);   // fit 0% = as if there were no reference
+                proc->setSlotWeight (kTrackSlot, 0.0f);   // fit 0% = as if there were no track
                 waitFor (*proc, proc->getResultVersion() + 1, 30000);
                 CHECK (onBeatShare (*proc->getDisplayResult()) > after2, "FIT at 0% puts the slices back");
-                proc->setSlotReference (7, false);
-                proc->clearSlot (7);
+                proc->clearSlot (kTrackSlot);
                 setParam ("pattern", 2);
                 waitFor (*proc, proc->getResultVersion() + 1, 30000);
-                CHECK (proc->getReferenceSlot() == -1, "clearing the slot ends FIT TO TRACK");
+                CHECK (proc->getReferenceSlot() == -1, "clearing the box ends FIT TO TRACK");
             }
 
             // the motif repeat must survive SRC
@@ -1061,9 +1062,9 @@ int main (int argc, char** argv)
             snapshot (*ed, out.getChildFile ("tour_6.png"), 1.0f);
             CHECK (view.getTour().keyPressed (juce::KeyPress (juce::KeyPress::leftKey)) && view.getTour().getStep() == 4, "tour: left arrow goes back");
             CHECK (! view.getTour().keyPressed (juce::KeyPress (juce::KeyPress::spaceKey)), "tour lets other keys through to the host");
-            view.getTour().goTo (6);
+            view.getTour().goTo (7);
             pump (200);
-            snapshot (*ed, out.getChildFile ("tour_7.png"), 1.0f);
+            snapshot (*ed, out.getChildFile ("tour_8.png"), 1.0f);
             view.getTour().goTo (1);
             pump (200);
             CHECK (view.getTour().isVisible() && view.getTour().getStep() == 1, "the tour has a step for FIT TO TRACK");
@@ -1071,33 +1072,44 @@ int main (int argc, char** argv)
             view.getTour().keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
             CHECK (! view.getTour().isVisible(), "tour: Esc closes it");
 
-            // FIT TO TRACK from the interface: the button on the slot, not only the right-click menu
-            auto* fit = findButton (view, "FIT");
-            CHECK (fit != nullptr, "every loaded sample shows a FIT button");
-            if (fit != nullptr)
+            // FIT TO TRACK from the interface: the box below the result
             {
                 const int was = proc->getReferenceSlot();
                 auto before5 = proc->getDisplayResult();
                 const int segsBefore = before5 != nullptr ? (int) before5->segments.size() : 0;
-                fit->triggerClick();
+                const int vBefore = proc->getResultVersion();
+                auto myTrackFile = out.getChildFile ("My_Track_Idea_140bpm.wav");
+                myTrackFile.deleteFile();
+                files[0].copyFileTo (myTrackFile);
+                proc->loadSlot (kTrackSlot, myTrackFile);
+                for (int t = 0; t < 100 && proc->getReferenceSlot() < 0; ++t)
+                    pump (100);
+                CHECK (proc->getReferenceSlot() == kTrackSlot && proc->getSlotInfo (kTrackSlot).reference,
+                       "a sample in the track box becomes your own track");
+                waitFor (*proc, vBefore + 1, 30000);
                 pump (300);
-                CHECK (proc->getReferenceSlot() == 0 && proc->getSlotInfo (0).reference,
-                       "the FIT button makes that sample your own track");
-                CHECK (fit->getToggleState(), "the FIT button lights up while it is on");
-                waitFor (*proc, proc->getResultVersion() + 1, 30000);
-                pump (200);
                 auto fitted = proc->getDisplayResult();
                 std::cout << "     slices: " << segsBefore << " before FIT, "
                           << (fitted != nullptr ? (int) fitted->segments.size() : -1) << " with FIT on\n";
-                // the reference is an offbeat bassline and the rhythm is Offbeat: every hit lands
+                // the track is an offbeat bassline and the rhythm is Offbeat: every hit lands
                 // exactly where the track is busy, so without a floor FIT would skip the whole loop
                 CHECK (fitted != nullptr && (int) fitted->segments.size() >= 4,
                        "FIT never leaves you with an empty loop: every bar keeps at least one slice");
                 snapshot (*ed, out.getChildFile ("screenshot_fit.png"), 1.0f);
-                fit->triggerClick();
-                pump (300);
-                CHECK (proc->getReferenceSlot() == -1 && ! fit->getToggleState(), "clicking FIT again turns it off");
-                CHECK (was == -1, "no sample is your own track until you say so");
+
+                // the two cut lines, on a sample and on the track
+                proc->setSlotTrim (0, 0.18f, 0.62f);
+                proc->setSlotTrim (kTrackSlot, 0.25f, 0.80f);
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                pump (400);
+                snapshot (*ed, out.getChildFile ("screenshot_trim.png"), 1.0f);
+                CHECK (std::abs (proc->getSlotInfo (0).trimStart - 0.18f) < 0.001f, "the cut lines reach the slot");
+                proc->setSlotTrim (0, 0.0f, 1.0f);
+
+                proc->clearSlot (kTrackSlot);
+                pump (400);
+                CHECK (proc->getReferenceSlot() == -1, "emptying the box turns FIT TO TRACK off again");
+                CHECK (was == -1, "nothing is your own track until you drop something in the box");
                 waitFor (*proc, proc->getResultVersion() + 1, 30000);
             }
         }
@@ -1231,7 +1243,7 @@ int main (int argc, char** argv)
         CHECK (! p10->isStandalone() && keyOf (*p10) == 16, "a DAW project keeps the key it was saved with");
     }
 
-    // ---- FIT TO TRACK housekeeping: the KEY and the share must not get stuck on a track that is gone
+    // ---- FIT TO TRACK housekeeping: the KEY must not get stuck on a track that is gone
     {
         auto keyOf = [] (SliceTribeProcessor& p) { return (int) p.apvts.getRawParameterValue ("key")->load(); };
         FakeHost h;
@@ -1243,98 +1255,140 @@ int main (int argc, char** argv)
         auto myTrack = out.getChildFile ("MyTrack_Am_140bpm.wav");
         myTrack.deleteFile();
         files[0].copyFileTo (myTrack);
-        p11->loadSlot (0, myTrack);
-        p11->loadSlot (1, files[1]);
+        p11->loadSlot (0, files[1]);
         waitFor (*p11, 1, 30000);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
 
         if (auto* prm = p11->apvts.getParameter ("key"))
             prm->setValueNotifyingHost (prm->convertTo0to1 (16.0f));
-        p11->setSlotWeight (0, 0.0f);
-        p11->setSlotReference (0, true);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        CHECK (p11->getSlotInfo (0).key == 19, "the sample's key is read from its name");
-        CHECK (keyOf (*p11) == 20, "KEY follows your own track (Am)");
-        CHECK (std::abs (p11->getSlotInfo (0).weight - 1.0f) < 0.01f, "FIT turns a 0% share into a workable 100% fit");
-        p11->setSlotReference (0, false);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        CHECK (p11->getSlotInfo (0).weight < 0.01f, "turning FIT off gives the slot its own share back");
-        CHECK (keyOf (*p11) == 16, "turning FIT off puts KEY back the way you had it");
-
-        p11->setSlotReference (0, true);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        const int keyWithTrack = keyOf (*p11);
-        p11->clearSlot (0);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        CHECK (p11->getReferenceSlot() == -1 && keyOf (*p11) == 16,
-               "clearing your own track puts KEY back too, instead of leaving it on that track's key");
-
-        p11->setSlotReference (1, true);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        p11->loadSlot (1, files[2]);
-        waitFor (*p11, p11->getResultVersion() + 1, 30000);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (800);
-        CHECK (p11->getReferenceSlot() == -1 && keyOf (*p11) == 16,
-               "dropping another sample on your own track ends FIT and puts KEY back");
-        std::cout << "     key with the track: " << keyWithTrack << ", back to " << keyOf (*p11) << "\n";
-
-        // FIT off on a slot that was never the reference must leave the real one alone
-        p11->loadSlot (0, myTrack);
-        p11->loadSlot (1, files[1]);
-        for (int t = 0; t < 60 && ! (p11->getSlotInfo (0).loaded && p11->getSlotInfo (1).loaded); ++t)
+        p11->loadSlot (kTrackSlot, myTrack);
+        for (int t = 0; t < 100 && p11->getReferenceSlot() < 0; ++t)
             juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        if (auto* prm = p11->apvts.getParameter ("key"))
-            prm->setValueNotifyingHost (prm->convertTo0to1 (16.0f));
-        p11->setSlotReference (0, true);
+        CHECK (p11->getSlotInfo (kTrackSlot).key == 19, "the track's key is read from its name");
+        CHECK (keyOf (*p11) == 20, "KEY follows your own track (Am)");
+        CHECK (p11->getReferenceSlot() == kTrackSlot, "the track box is the reference");
+
+        p11->clearSlot (kTrackSlot);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        p11->setSlotReference (1, false);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
-        CHECK (p11->getReferenceSlot() == 0, "FIT off on another slot does not switch your own track off");
+        CHECK (p11->getReferenceSlot() == -1 && keyOf (*p11) == 16,
+               "removing your own track puts KEY back, instead of leaving it on that track's key");
 
         // and the way back to your own KEY survives closing and reopening the project
+        p11->loadSlot (kTrackSlot, myTrack);
+        for (int t = 0; t < 100 && p11->getReferenceSlot() < 0; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
         juce::MemoryBlock st11;
         p11->getStateInformation (st11);
         auto p14 = std::make_unique<SliceTribeProcessor>();
         p14->prepareToPlay (48000.0, 512);
         p14->setStateInformation (st11.getData(), (int) st11.getSize());
-        for (int t = 0; t < 60 && p14->getReferenceSlot() < 0; ++t)
+        for (int t = 0; t < 100 && p14->getReferenceSlot() < 0; ++t)
             juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
-        CHECK (p14->getReferenceSlot() == 0, "your own track comes back with the project");
-        p14->setSlotReference (0, false);
+        CHECK (p14->getReferenceSlot() == kTrackSlot, "your own track comes back with the project");
+        p14->clearSlot (kTrackSlot);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
-        CHECK (keyOf (*p14) == 16, "after reopening a project, turning FIT off still puts KEY back");
-
-        p11->setSlotReference (0, false);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        CHECK (keyOf (*p14) == 16, "after reopening a project, removing the track still puts KEY back");
     }
 
-    // ---- pressing FIT while the file is still loading must survive the load
+    // ---- a project from before the track box existed: the marked slot moves into it
     {
-        auto p15 = std::make_unique<SliceTribeProcessor>();
-        p15->prepareToPlay (48000.0, 512);
-        // a long file, so the change really lands while the worker is still busy with it
-        auto slow = out.getChildFile ("long_track_125bpm.wav");
-        {
-            juce::AudioBuffer<float> b (2, (int) (48000.0 * 45.0));
-            for (int c = 0; c < 2; ++c)
-                for (int i = 0; i < b.getNumSamples(); ++i)
-                    b.setSample (c, i, 0.25f * (float) std::sin (i * 0.013) * (float) ((i / 4800) % 2));
-            engine::writeWav (slow, b, 48000.0, 1.0f);
-        }
-        p15->loadSlot (2, slow);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (60);   // the worker has the job now
-        CHECK (! p15->getSlotInfo (2).loaded, "the long sample is still loading");
-        p15->setSlotReference (2, true);     // the audio is still on its way in
-        p15->setSlotWeight (2, 1.5f);
-        p15->setSlotTranspose (2, 5);
-        for (int t = 0; t < 200 && ! p15->getSlotInfo (2).loaded; ++t)
+        auto p16 = std::make_unique<SliceTribeProcessor>();
+        p16->prepareToPlay (48000.0, 512);
+        p16->loadSlot (0, files[0]);
+        p16->loadSlot (1, files[1]);
+        for (int t = 0; t < 100 && ! p16->getSlotInfo (1).loaded; ++t)
             juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
-        CHECK (p15->getSlotInfo (2).loaded && p15->getSlotInfo (2).reference && p15->getReferenceSlot() == 2,
-               "FIT pressed while a sample is loading is still on when it arrives");
-        CHECK (std::abs (p15->getSlotInfo (2).weight - 1.5f) < 0.01f, "and so is a share you set during the load");
-        CHECK (p15->getSlotInfo (2).transpose == 5, "and a transpose you set during the load");
+        juce::MemoryBlock st16;
+        p16->getStateInformation (st16);
+        // rewrite it the way the old version saved it: slot 1 marked as "my track"
+        juce::MemoryInputStream in (st16.getData(), st16.getSize(), false);
+        in.readString();
+        auto root = juce::ValueTree::readFromStream (in);
+        auto slotsTree = root.getChildWithName ("SLOTS");
+        for (auto t : slotsTree)
+            if ((int) t.getProperty ("index", -1) == 1)
+                t.setProperty ("reference", true, nullptr);
+        juce::MemoryBlock old;
+        {
+            juce::MemoryOutputStream os (old, false);
+            os.writeString ("CHUPALOOPS1");
+            root.writeToStream (os);
+        }
+        auto p17 = std::make_unique<SliceTribeProcessor>();
+        p17->prepareToPlay (48000.0, 512);
+        p17->setStateInformation (old.getData(), (int) old.getSize());
+        for (int t = 0; t < 100 && p17->getReferenceSlot() < 0; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (p17->getReferenceSlot() == kTrackSlot && p17->getSlotInfo (kTrackSlot).loaded,
+               "an older project's 'my track' sample lands in the track box");
+        CHECK (! p17->getSlotInfo (1).loaded, "and is not left in its old slot as well");
+    }
+
+    // ---- the two cut lines: only that part of the sample is used, and it survives the project
+    {
+        auto p18 = std::make_unique<SliceTribeProcessor>();
+        p18->prepareToPlay (48000.0, 512);
+        p18->loadSlot (0, files[0]);
+        for (int t = 0; t < 100 && ! p18->getSlotInfo (0).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        p18->setSlotTrim (0, 0.5f, 0.75f);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        CHECK (std::abs (p18->getSlotInfo (0).trimStart - 0.5f) < 0.001f
+            && std::abs (p18->getSlotInfo (0).trimEnd - 0.75f) < 0.001f, "the two lines are stored on the slot");
+
+        // and they really steer the renderer: every slice must come from that quarter of the sample
+        {
+            FakeHost h18;
+            auto p20 = std::make_unique<SliceTribeProcessor>();
+            p20->setPlayHead (&h18);
+            p20->prepareToPlay (48000.0, 512);
+            runHost (*p20, h18, 0.05, nullptr);
+            p20->loadSlot (0, files[0]);
+            waitFor (*p20, 1, 30000);
+            auto whole = p20->getDisplayResult();
+            juce::int64 lo = 1 << 30, hi = 0;
+            for (const auto& sg : whole->segments) { lo = juce::jmin (lo, sg.srcStart); hi = juce::jmax (hi, sg.srcStart); }
+            const int v20 = p20->getResultVersion();
+            p20->setSlotTrim (0, 0.5f, 0.75f);
+            CHECK (waitFor (*p20, v20 + 1, 30000), "the loop is rebuilt when you move the lines");
+            auto cutDown = p20->getDisplayResult();
+            juce::int64 lo2 = 1 << 30, hi2 = 0;
+            for (const auto& sg : cutDown->segments) { lo2 = juce::jmin (lo2, sg.srcStart); hi2 = juce::jmax (hi2, sg.srcStart); }
+            const double total = whole->settings.bars > 0 ? 1.0 : 1.0;
+            juce::ignoreUnused (total);
+            std::cout << "     slice positions: " << lo << ".." << hi << " over the whole sample, "
+                      << lo2 << ".." << hi2 << " between the lines\n";
+            CHECK (! cutDown->segments.empty() && lo2 > hi / 3 && lo2 > lo,
+                   "with the lines set, slices only come from that part of the sample");
+        }
+        juce::MemoryBlock st18;
+        p18->getStateInformation (st18);
+        auto p19 = std::make_unique<SliceTribeProcessor>();
+        p19->prepareToPlay (48000.0, 512);
+        p19->setStateInformation (st18.getData(), (int) st18.getSize());
+        for (int t = 0; t < 100 && ! p19->getSlotInfo (0).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (std::abs (p19->getSlotInfo (0).trimStart - 0.5f) < 0.001f
+            && std::abs (p19->getSlotInfo (0).trimEnd - 0.75f) < 0.001f, "and they come back with the project");
+    }
+
+    // ---- FIT at 0% is a real setting and must survive a save
+    {
+        auto p21 = std::make_unique<SliceTribeProcessor>();
+        p21->prepareToPlay (48000.0, 512);
+        p21->loadSlot (kTrackSlot, files[0]);
+        for (int t = 0; t < 100 && ! p21->getSlotInfo (kTrackSlot).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        p21->setSlotWeight (kTrackSlot, 0.0f);
+        juce::MemoryBlock st21;
+        p21->getStateInformation (st21);
+        auto p22 = std::make_unique<SliceTribeProcessor>();
+        p22->prepareToPlay (48000.0, 512);
+        p22->setStateInformation (st21.getData(), (int) st21.getSize());
+        for (int t = 0; t < 100 && ! p22->getSlotInfo (kTrackSlot).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (p22->getSlotInfo (kTrackSlot).weight < 0.01f, "FIT at 0% comes back as 0%, not as 100%");
     }
 
     // ---- the tempo you set in the standalone is part of the session
