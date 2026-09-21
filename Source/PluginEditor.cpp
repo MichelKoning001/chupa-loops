@@ -233,7 +233,7 @@ MainView::MainView (SliceTribeProcessor& p)
     addAndMakeVisible (spliceButton);
 
     clearAllButton.setButtonText ("CLEAR ALL");
-    clearAllButton.setTooltip ("Empty all 8 slots and the track box (click twice)");
+    clearAllButton.setTooltip ("Empty all 8 slots and the track box, and put every knob back to normal (click twice)");
     clearAllButton.onClick = [this] { clearAllSlots(); };
     addAndMakeVisible (clearAllButton);
 
@@ -312,7 +312,7 @@ void MainView::startTour()
         { { 16, 102, 1088, 196 }, "1. Drop your loops",
           "Drop up to 8 loops here - basslines, synths, vocals, drums, any tempo and any key. Tempo and key are read from the file name, or from the audio itself. "
           "The triangle listens to one sample on its own, the % says how often slices are taken from it, and the two lines over the waveform pick the part you "
-          "want to use." },
+          "want to use. STR pulls a human recording - an old record, a live take - onto the grid." },
         { { 16, 520, 262, 92 }, "2. FIT TO TRACK",
           "Drop a part of YOUR OWN song in this box. It is never sliced: it is the track the new loop has to fit around. Chupa Loops hears where your "
           "track is busy and leaves room there, and the key follows it. The % says how hard the new loop stays out of your track's way, and the two "
@@ -648,6 +648,7 @@ void MainView::clearAllSlots()
     clearAllButton.setButtonText ("CLEAR ALL");
     for (int i = 0; i < kAllSlots; ++i)
         proc.clearSlot (i);
+    proc.resetSettings();   // and every knob back to normal, so you start from scratch
 }
 
 //==============================================================================

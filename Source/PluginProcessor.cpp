@@ -972,6 +972,7 @@ void SliceTribeProcessor::run()
                 slotAudio[(size_t) i] = std::move (a);
                 slotState[(size_t) i] = live;
                 embeddedAudio[(size_t) i] = std::move (emb);
+                warpedShared[(size_t) i].reset();   // the straightened copy belonged to the old file
 
             }
             slotsVersion.fetch_add (1);
@@ -1023,7 +1024,48 @@ void SliceTribeProcessor::run()
             if (a.original == nullptr)
             {
                 if (p.audio != nullptr) { p = {}; changed = true; }
+                warpedAudio[(size_t) i].reset();
+                warpedKey[(size_t) i] = {};
+                publishWarped (i);
                 continue;
+            }
+
+            // STRAIGHT: pull a human recording onto the grid before anything else happens to it
+            if (st.warp > 0.001f)
+            {
+                const double warpBpm = st.bpmOverride > 0.0 ? st.bpmOverride : a.detectedBpm;
+                const bool smoothWarp = s.stretchMode == stretchSmooth;
+                auto& key = warpedKey[(size_t) i];
+                if (! key.done || key.loadId != a.loadId
+                    || std::abs (key.bpm - warpBpm) > 1.0e-6 || std::abs (key.amount - st.warp) > 1.0e-6
+                    || key.smooth != smoothWarp)
+                {
+                    busy = true;
+                    prepareInterrupt = abortWork.load();
+                    auto straight = engine::straighten (*a.original, a.fileRate, warpBpm, st.warp, smoothWarp, &prepareInterrupt);
+                    if (abortWork.load())
+                        break;
+                    if (prepareInterrupt.exchange (false))
+                    {
+                        allPrepared = false;
+                        break;
+                    }
+                    // an empty result means "nothing to pull straight" - remember that, so we do not try again every pass
+                    if (straight.getNumSamples() > 0)
+                        warpedAudio[(size_t) i] = std::make_shared<const juce::AudioBuffer<float>> (std::move (straight));
+                    else
+                        warpedAudio[(size_t) i].reset();
+                    key = { a.loadId, warpBpm, st.warp, smoothWarp, true };
+                    publishWarped (i);
+                }
+                if (warpedAudio[(size_t) i] != nullptr)
+                    a.original = warpedAudio[(size_t) i];
+            }
+            else if (warpedAudio[(size_t) i] != nullptr || warpedKey[(size_t) i].done)
+            {
+                warpedAudio[(size_t) i].reset();
+                warpedKey[(size_t) i] = {};
+                publishWarped (i);
             }
             if (std::abs (p.weight - st.weight) > 1.0e-6f)   // the share needs no new preparation
             {
@@ -1044,6 +1086,7 @@ void SliceTribeProcessor::run()
             st.bpmOverride = srcBpm;
             const int effT = juce::jlimit (-24, 24, st.transpose + (keyTarget >= 0 ? engine::keyShift (a.detectedKey, keyTarget) : 0));
             const bool need = p.loadId != a.loadId || p.rate != rate || p.transpose != effT || p.mode != s.stretchMode
+                           || std::abs (p.warp - st.warp) > 1.0e-6
                            || (s.stretchMode == stretchSmooth && p.hostBpm != bpm)
                            || std::abs (p.srcBpm - srcBpm) > 1.0e-6 || (wantOctave && ! p.withOctave);
 
@@ -1066,6 +1109,7 @@ void SliceTribeProcessor::run()
                     break;
                 }
                 np.loadId = a.loadId;
+                np.warp = st.warp;
                 if (np.audio != nullptr)
                 {
                     np.onsets = engine::detectOnsets (*np.audio, np.beatLen, s.sensitivity);
@@ -1415,6 +1459,7 @@ SlotInfo SliceTribeProcessor::getSlotInfo (int i) const
     info.reference = i == kTrackSlot;
     info.trimStart = st.trimStart;
     info.trimEnd = st.trimEnd;
+    info.warp = st.warp;
     info.name = a.name.isNotEmpty() ? a.name
               : pending[(size_t) i].active ? pending[(size_t) i].file.getFileNameWithoutExtension()
               : missingFile[(size_t) i].getFileNameWithoutExtension();
@@ -1480,7 +1525,8 @@ void SliceTribeProcessor::setSlotPreview (int slot)
     if (juce::isPositiveAndBelow (slot, kAllSlots))
     {
         const juce::ScopedLock sl (slotLock);
-        audio = slotAudio[(size_t) slot].original;
+        audio = warpedShared[(size_t) slot] != nullptr ? warpedShared[(size_t) slot]   // STRAIGHT is on: play that
+                                                       : slotAudio[(size_t) slot].original;
         fileRate = slotAudio[(size_t) slot].fileRate;
         trimA = slotState[(size_t) slot].trimStart;
         trimB = slotState[(size_t) slot].trimEnd;
@@ -1585,6 +1631,7 @@ void SliceTribeProcessor::clearSlot (int slot)
         slotMissing[(size_t) slot] = false;
         missingFile[(size_t) slot] = juce::File();
         embeddedAudio[(size_t) slot].reset();
+        warpedShared[(size_t) slot].reset();
         ++slotGeneration[(size_t) slot];
         slotError[(size_t) slot] = false;
     }
@@ -1634,6 +1681,27 @@ void SliceTribeProcessor::setSlotWeight (int slot, float w)
 }
 
 /** Measures how busy your own track is, over the part between the two lines (worker thread). */
+/** Hand the worker's straightened copy to the message thread, so previewing a slot plays
+    the straightened audio - what the loop is actually built from. */
+void SliceTribeProcessor::publishWarped (int slot)
+{
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
+        return;
+    auto next = warpedAudio[(size_t) slot];
+    bool changed = false;
+    {
+        const juce::ScopedLock sl (slotLock);
+        changed = warpedShared[(size_t) slot] != next;
+        if (changed)
+            warpedShared[(size_t) slot] = std::move (next);
+    }
+    if (changed && slotPreviewIndex.load() == slot)
+    {
+        warpPreviewRearm = true;   // it is playing right now: pick up the new version (message thread)
+        triggerAsyncUpdate();
+    }
+}
+
 void SliceTribeProcessor::regridTrack()
 {
     std::shared_ptr<const juce::AudioBuffer<float>> audio;
@@ -1752,6 +1820,16 @@ void SliceTribeProcessor::applyReferenceKey (int slot)
 
 void SliceTribeProcessor::handleAsyncUpdate()
 {
+    if (warpPreviewRearm.exchange (false))
+    {
+        // STRAIGHT came on or off while this slot was playing: play the version you now get
+        const int slot = slotPreviewIndex.load();
+        if (slot >= 0)
+        {
+            slotPreviewIndex = -1;       // so setSlotPreview does not read it as "click again = stop"
+            setSlotPreview (slot);
+        }
+    }
     if (keyRestoreWanted.exchange (false))
         restoreKeyAfterReference();
     if (const int waiting = pendingReferenceKey.load(); waiting >= 0 && waiting == referenceSlot.load())
@@ -1776,6 +1854,20 @@ void SliceTribeProcessor::restoreKeyAfterReference()
             prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, prm->convertTo0to1 ((float) back)));
             prm->endChangeGesture();
         }
+}
+
+/** How hard a human recording is pulled onto the grid (0 = as recorded, 1 = dead straight). */
+void SliceTribeProcessor::setSlotWarp (int slot, float amount)
+{
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
+        return;
+    const float a = juce::jlimit (0.0f, 1.0f, amount);
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [a] (SlotState& st) { st.warp = a; }); }
+    if (slot == kTrackSlot)
+        trackRegrid = true;
+    prepareInterrupt = true;
+    slotsVersion.fetch_add (1);
+    requestUpdate();
 }
 
 /** The two lines on a slot: only the part between them is used (0..1 of the sample). */
@@ -1868,6 +1960,23 @@ void SliceTribeProcessor::applyParamValues (const ParamMap& values)
                 prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, prm->convertTo0to1 (v)));
                 prm->endChangeGesture();
             }
+}
+
+/** Everything back to the factory position: the knobs, the FX and "back to normal".
+    Used by CLEAR ALL, so you really start from scratch. */
+void SliceTribeProcessor::resetSettings()
+{
+    for (auto& id : presetParameterIds())
+        if (auto* prm = apvts.getParameter (id))
+            if (std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-4f)
+            {
+                prm->beginChangeGesture();
+                prm->setValueNotifyingHost (prm->getDefaultValue());
+                prm->endChangeGesture();
+            }
+    crazyActive = false;
+    keyRestoreWanted = false;
+    keyBeforeReference = -1;
 }
 
 void SliceTribeProcessor::generateNew (const ParamMap* settingsBefore)
@@ -2334,6 +2443,7 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
             t.setProperty ("weight", st.weight, nullptr);
             t.setProperty ("trimStart", st.trimStart, nullptr);
             t.setProperty ("trimEnd", st.trimEnd, nullptr);
+            t.setProperty ("warp", st.warp, nullptr);
             if (detected > 0.0)
                 t.setProperty ("detectedBpm", detected, nullptr);
             // name and key travel with the project, also to a computer where the path doesn't exist
@@ -2395,6 +2505,8 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     autoPickRequest = 0;      // a queued job must never overwrite the project that is being opened
     stemsRequest = false;
     jobBusy = false;
+    if (slotPreviewIndex.load() >= 0 && juce::MessageManager::getInstance()->isThisTheMessageThread())
+        setSlotPreview (-1);  // never keep playing the previous project's sample
     crazyActive = false;      // and "back to normal" never carries over into another project
     pendingReferenceKey = -1; // nor does anything FIT TO TRACK remembered about the previous one
     keyBeforeReference = -1;  // (the project may put this one back, below)
@@ -2467,6 +2579,7 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
         st.weight = juce::jlimit (0.0f, 2.0f, (float) (double) t.getProperty ("weight", 1.0));
         st.trimStart = juce::jlimit (0.0f, 1.0f, (float) (double) t.getProperty ("trimStart", 0.0));
         st.trimEnd   = juce::jlimit (st.trimStart, 1.0f, (float) (double) t.getProperty ("trimEnd", 1.0));
+        st.warp      = juce::jlimit (0.0f, 1.0f, (float) (double) t.getProperty ("warp", 0.0));
 
         const juce::MemoryBlock* emb = t.getProperty ("audio").getBinaryData();
         const auto path = t.getProperty ("path").toString();
@@ -2568,7 +2681,13 @@ void SliceTribeProcessor::crazyLoop (int flavour)
 {
     const RenderHold hold (*this);              // no half-crazy render in between (and the locks stay intact)
     const auto before = currentParamValues();   // so the previous version (with ◀) brings the old settings back
-    { const juce::ScopedLock jl (jobLock); beforeCrazy = before; }
+    {
+        // Several crazy buttons in a row: keep the last really normal settings as the way back,
+        // otherwise NEW LOOP would only return to the previous crazy loop.
+        const juce::ScopedLock jl (jobLock);
+        if (! crazyActive.load() || ! sameParams (afterCrazy, before))
+            beforeCrazy = before;
+    }
     auto& r = juce::Random::getSystemRandom();
     auto set = [this] (const char* id, float plain)
     {

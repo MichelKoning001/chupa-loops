@@ -147,6 +147,7 @@ struct PreparedSlot
     double hostBpm = 0, rate = 0, srcBpm = 0;
     float weight = 1.0f;
     float trimStart = 0.0f, trimEnd = 1.0f;   // slices are only taken from between these
+    float warp = 0.0f;                        // how straight this one was pulled
     int transpose = 0;                // effective (manual + key match)
     int mode = stretchBeats;
     bool withOctave = false;
@@ -163,6 +164,7 @@ struct SlotState
     float  weight = 1.0f;       // 0..2: how often slices are taken from this sample (1 = normal share)
     float  trimStart = 0.0f;    // only the part between these two lines is used (0..1 of the sample)
     float  trimEnd   = 1.0f;
+    float  warp      = 0.0f;    // 0..1: how hard a human recording is pulled onto the grid
 };
 
 //==============================================================================
@@ -229,6 +231,17 @@ namespace engine
 
     /** Transient detection. sensitivity 0..1; beatLen = samples per beat in this buffer. */
     std::vector<int> detectOnsets (const juce::AudioBuffer<float>&, double beatLen, float sensitivity);
+
+    /** Where the beats of a recording really are: one entry per beat of the expected grid.
+        Empty when there is nothing convincing to hear. */
+    std::vector<int> findBeats (const juce::AudioBuffer<float>&, double rate, double bpm, int& numBeats,
+                                double* gridOffset = nullptr);
+
+    /** Pulls a wobbly recording straight: every beat it hears moves onto an even grid.
+        amount 0 = untouched, 1 = dead straight. smooth = time-stretch (vocals, pads) instead of
+        re-speeding the bit between two beats (punchier, and the pitch rides along like on vinyl). */
+    juce::AudioBuffer<float> straighten (const juce::AudioBuffer<float>&, double rate, double bpm,
+                                         float amount, bool smooth, const std::atomic<bool>* abort = nullptr);
 
     /** How busy every 1/16 of a bar is in this audio (0..1 per step), for FIT TO TRACK. */
     std::array<float, 16> gridProfile (const juce::AudioBuffer<float>&, double rate, double bpm);

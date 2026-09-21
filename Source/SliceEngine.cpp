@@ -776,6 +776,248 @@ juce::AudioBuffer<float> engine::stretchLoop (const juce::AudioBuffer<float>& in
     return out;
 }
 
+//==============================================================================
+// Straightening: pulling a human recording onto the grid
+//==============================================================================
+std::vector<int> engine::findBeats (const juce::AudioBuffer<float>& in, double rate, double bpm, int& numBeats,
+                                    double* gridOffset)
+{
+    numBeats = 0;
+    const int len = in.getNumSamples();
+    if (len < 1024 || rate <= 0.0 || bpm <= 20.0)
+        return {};
+    const double beatLen = rate * 60.0 / bpm;          // the real beat, not the file length divided up
+    const int beats = (int) std::floor (len / beatLen + 0.02);
+    if (beats < 2 || beats > 512)
+        return {};
+
+    auto onsets = detectOnsets (in, beatLen, 0.6f);
+    if (onsets.size() < 3)
+        return {};
+
+    // how loud every attack is, so a kick wins from a hi-hat that happens to sit closer
+    const int win = juce::jmax (64, (int) (rate * 0.02));
+    std::vector<float> punch (onsets.size(), 0.0f);
+    float loudest = 1.0e-9f;
+    for (size_t i = 0; i < onsets.size(); ++i)
+    {
+        double e = 0.0;
+        const int n = juce::jmin (win, len - onsets[i]);
+        for (int ch = 0; ch < in.getNumChannels(); ++ch)
+        {
+            const float* dd = in.getReadPointer (ch) + onsets[i];
+            for (int k = 0; k < n; ++k) e += (double) dd[k] * dd[k];
+        }
+        punch[i] = (float) std::sqrt (e / juce::jmax (1, n * in.getNumChannels()));
+        loudest = juce::jmax (loudest, punch[i]);
+    }
+
+    const double window = beatLen * 0.34;
+    auto scoreFor = [&] (double offset, std::vector<int>* fill) -> double
+    {
+        double total = 0.0;
+        int hits = 0;
+        for (int k = 0; k <= beats; ++k)
+        {
+            const double want = offset + k * beatLen;
+            if (want < -1.0 || want > len + 1.0)
+            {
+                if (fill != nullptr) (*fill)[(size_t) k] = -1;
+                continue;
+            }
+            double best = 0.0;
+            int bestPos = -1;
+            for (size_t i = 0; i < onsets.size(); ++i)
+            {
+                const double dist = std::abs (onsets[i] - want);
+                if (dist > window) continue;
+                const double sc = punch[i] / loudest * (1.0 - 0.55 * dist / window);
+                if (sc > best) { best = sc; bestPos = onsets[i]; }
+            }
+            if (bestPos >= 0 && best > 0.12)
+            {
+                total += best;
+                ++hits;
+                if (fill != nullptr) (*fill)[(size_t) k] = bestPos;
+            }
+            else if (fill != nullptr)
+                (*fill)[(size_t) k] = -1;
+        }
+        return hits >= 2 ? total : 0.0;
+    };
+
+    // where does beat one sit? try every early attack as the start of the grid
+    double bestOffset = 0.0, bestScore = scoreFor (0.0, nullptr);
+    for (int o : onsets)
+    {
+        if (o > beatLen * 1.05)
+            break;
+        const double sc = scoreFor ((double) o, nullptr);
+        if (sc > bestScore * 1.02) { bestScore = sc; bestOffset = (double) o; }
+    }
+
+    std::vector<int> anchors ((size_t) beats + 1, -1);
+    scoreFor (bestOffset, &anchors);
+    int found = 0;
+    for (int k = 0; k <= beats; ++k)
+        found += anchors[(size_t) k] >= 0 ? 1 : 0;
+    if (found * 3 < beats + 1)
+        return {};   // not enough to hear a beat: leave the recording alone
+
+    // never let two anchors cross
+    int last = -1;
+    for (int k = 0; k <= beats; ++k)
+    {
+        if (anchors[(size_t) k] < 0) continue;
+        if (anchors[(size_t) k] <= last) anchors[(size_t) k] = -1;
+        else last = anchors[(size_t) k];
+    }
+    numBeats = beats;
+    if (gridOffset != nullptr)
+        *gridOffset = bestOffset;   // where beat one sits: the grid the anchors were measured against
+    return anchors;
+}
+
+juce::AudioBuffer<float> engine::straighten (const juce::AudioBuffer<float>& in, double rate, double bpm,
+                                             float amount, bool smooth, const std::atomic<bool>* abort)
+{
+    const int len = in.getNumSamples(), ch = in.getNumChannels();
+    if (amount <= 0.001f || len < 1024 || ch < 1)
+        return {};
+
+    int beats = 0;
+    double offset = 0.0;
+    auto anchors = findBeats (in, rate, bpm, beats, &offset);
+    if (beats < 2 || anchors.empty())
+        return {};
+
+    // where every beat should end up: on the real beat grid, at the phase findBeats measured
+    // the anchors against (never re-derived from one anchor - that one may itself be off)
+    const double beatLen = rate * 60.0 / bpm;
+    const double a = juce::jlimit (0.0, 1.0, (double) amount);
+
+    std::vector<double> from, to;
+    from.push_back (0.0); to.push_back (0.0);
+    for (int k = 0; k <= beats; ++k)
+    {
+        if (anchors[(size_t) k] < 0)
+            continue;
+        const double want = offset + k * beatLen;
+        const double src = anchors[(size_t) k];
+        const double dst = juce::jlimit (0.0, (double) len, src + a * (want - src));
+        if (src > from.back() + 32.0 && dst > to.back() + 32.0 && src < len - 32.0 && dst < len - 32.0)
+        {
+            from.push_back (src);
+            to.push_back (dst);
+        }
+    }
+    from.push_back ((double) len); to.push_back ((double) len);
+    if (from.size() < 3)
+        return {};
+
+    bool moved = false;
+    for (size_t i = 0; i < from.size(); ++i)
+        moved = moved || std::abs (from[i] - to[i]) > rate * 0.0015;   // more than 1.5 ms
+    if (! moved)
+        return {};
+
+    juce::AudioBuffer<float> out (ch, len);
+    out.clear();
+    auto aborted = [abort] { return abort != nullptr && abort->load(); };
+
+    if (! smooth)
+    {
+        // A smooth (monotone) curve through the anchors, so the speed - and with it the pitch -
+        // glides instead of stepping at every beat, the way a record does when you nudge it.
+        const size_t n = from.size();
+        std::vector<double> slope (n, 0.0), seg (n, 0.0);
+        for (size_t i = 0; i + 1 < n; ++i)
+            seg[i] = (from[i + 1] - from[i]) / juce::jmax (1.0, to[i + 1] - to[i]);
+        slope[0] = seg[0];
+        slope[n - 1] = seg[n - 2];
+        for (size_t i = 1; i + 1 < n; ++i)
+        {
+            if (seg[i - 1] * seg[i] <= 0.0) { slope[i] = 0.0; continue; }
+            const double w1 = 2.0 * (to[i + 1] - to[i]) + (to[i] - to[i - 1]);
+            const double w2 = (to[i + 1] - to[i]) + 2.0 * (to[i] - to[i - 1]);
+            slope[i] = (w1 + w2) / (w1 / seg[i - 1] + w2 / seg[i]);
+        }
+        size_t k = 0;
+        for (int i = 0; i < len; ++i)
+        {
+            if ((i & 0x3ff) == 0 && aborted()) return {};
+            while (k + 2 < n && i >= to[k + 1]) ++k;
+            const double h = juce::jmax (1.0, to[k + 1] - to[k]);
+            const double t = juce::jlimit (0.0, 1.0, (i - to[k]) / h);
+            const double t2 = t * t, t3 = t2 * t;
+            const double pos = (2 * t3 - 3 * t2 + 1) * from[k] + (t3 - 2 * t2 + t) * h * slope[k]
+                             + (-2 * t3 + 3 * t2) * from[k + 1] + (t3 - t2) * h * slope[k + 1];
+            const int p0 = juce::jlimit (0, len - 1, (int) pos);
+            const int p1 = juce::jmin (len - 1, p0 + 1);
+            const float f = (float) juce::jlimit (0.0, 1.0, pos - p0);
+            for (int c = 0; c < ch; ++c)
+            {
+                const float* src = in.getReadPointer (c);
+                out.getWritePointer (c)[i] = src[p0] + (src[p1] - src[p0]) * f;
+            }
+        }
+        return out;
+    }
+
+    // Time-stretch instead, so a vocal keeps its pitch. The stretcher runs behind by its own
+    // latency, so we let it write a little further and then take the part that lines up. That
+    // delay is inputLatency worth of INPUT plus outputLatency worth of OUTPUT, so the input half
+    // has to be counted at the speed of the first stretch, not at 1:1.
+    signalsmith::stretch::SignalsmithStretch<float> st;
+    st.presetDefault (ch, (float) rate);
+    const double firstRate = juce::jlimit (0.25, 4.0, (from[1] - from[0]) / juce::jmax (1.0, to[1] - to[0]));
+    const int lat = juce::jmax (0, (int) std::llround (st.outputLatency() + st.inputLatency() / firstRate));
+    const int tempLen = len + lat + 16;
+
+    std::vector<std::vector<float>> tin ((size_t) ch, std::vector<float> ((size_t) (len + lat + 32), 0.0f));
+    std::vector<std::vector<float>> tmp ((size_t) ch, std::vector<float> ((size_t) tempLen, 0.0f));
+    for (int c = 0; c < ch; ++c)
+    {
+        const float* src = in.getReadPointer (c);
+        std::copy (src, src + len, tin[(size_t) c].begin());
+        for (int i = 0; i < lat + 32; ++i)                 // the loop wraps, so the tail flows on
+            tin[(size_t) c][(size_t) (len + i)] = src[i % len];
+    }
+    std::vector<float*> ci ((size_t) ch), co ((size_t) ch);
+    int outPos = 0;
+    auto run = [&] (int inStart, int inN, int outN)
+    {
+        if (inN < 1 || outN < 1 || outPos + outN > tempLen)
+            return;
+        for (int c = 0; c < ch; ++c)
+        {
+            ci[(size_t) c] = tin[(size_t) c].data() + inStart;
+            co[(size_t) c] = tmp[(size_t) c].data() + outPos;
+        }
+        st.process (ci.data(), inN, co.data(), outN);
+        outPos += outN;
+    };
+
+    for (size_t k = 0; k + 1 < from.size(); ++k)
+    {
+        if (aborted()) return {};
+        const int s0 = (int) std::llround (from[k]), s1 = (int) std::llround (from[k + 1]);
+        const int d0 = (int) std::llround (to[k]),   d1 = (int) std::llround (to[k + 1]);
+        run (s0, s1 - s0, juce::jmin (d1, len) - d0);
+    }
+    run (len, lat + 8, juce::jmin (lat + 8, tempLen - outPos));   // let the tail come out too
+    if (aborted()) return {};
+
+    for (int c = 0; c < ch; ++c)
+    {
+        float* dst = out.getWritePointer (c);
+        const float* src = tmp[(size_t) c].data() + lat;
+        for (int i = 0; i < len; ++i)
+            dst[i] = src[i];
+    }
+    return out;
+}
+
 PreparedSlot engine::prepare (const SlotAudio& a, const SlotState& state, int effTranspose, double hostBpm, double rate,
                               bool withOctave, int mode, const std::atomic<bool>* abort)
 {

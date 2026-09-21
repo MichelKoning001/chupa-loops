@@ -630,6 +630,154 @@ int main()
         CHECK (seam < 0.01f, "non-looping file gets a click-free seam");
     }
 
+    // ---- straightening a human recording onto the grid
+    {
+        const double rate = 48000.0, bpm = 120.0;
+        const double beatLen = rate * 60.0 / bpm;
+        const int beats = 16;
+        const int len = (int) std::llround (beats * beatLen);
+
+        auto clickAt = [rate] (juce::AudioBuffer<float>& b, int pos, float gain)
+        {
+            const int n = (int) (rate * 0.035);
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 0; i < n && pos + i < b.getNumSamples(); ++i)
+                {
+                    const double t = i / rate;
+                    const float v = (float) (std::sin (juce::MathConstants<double>::twoPi * 70.0 * t)
+                                             * std::exp (-t * 45.0) * gain);
+                    b.addSample (ch, pos + i, v);
+                }
+        };
+
+        // a drummer who drags: every beat a little off, worse as the loop goes on
+        std::vector<int> crooked;
+        juce::AudioBuffer<float> wobbly (2, len);
+        wobbly.clear();
+        for (int k = 0; k < beats; ++k)
+        {
+            const double even = k * beatLen;
+            const double off = (std::sin (k * 1.9) * 0.016 + (k % 3 == 0 ? 0.008 : -0.006)) * rate * (0.4 + 0.6 * k / beats);
+            const int pos = juce::jlimit (0, len - 1, (int) std::llround (even + off));
+            crooked.push_back (pos);
+            clickAt (wobbly, pos, k % 4 == 0 ? 0.9f : 0.55f);
+        }
+
+        auto worstError = [&] (const juce::AudioBuffer<float>& b)
+        {
+            auto on = engine::detectOnsets (b, beatLen, 0.6f);
+            double worst = 0.0;
+            for (int k = 0; k < beats; ++k)
+            {
+                const double want = k * beatLen;
+                double best = 1.0e9;
+                for (int o : on) best = juce::jmin (best, std::abs (o - want));
+                worst = juce::jmax (worst, best);
+            }
+            return worst / rate * 1000.0;   // ms
+        };
+
+        int found = 0;
+        auto anchors = engine::findBeats (wobbly, rate, bpm, found);
+        std::cout << "     beats found: " << found << " of " << beats << "\n";
+        CHECK (found == beats && (int) anchors.size() == beats + 1, "every beat of a 16-beat recording is found");
+
+        const double before = worstError (wobbly);
+        auto straight = engine::straighten (wobbly, rate, bpm, 1.0f, false);
+        const double after = worstError (straight);
+        std::cout << "     worst beat off the grid: " << juce::String (before, 1) << " ms before, "
+                  << juce::String (after, 1) << " ms after\n";
+        CHECK (before > 8.0 && after < 3.0, "straightening pulls every beat onto the grid");
+        CHECK (straight.getNumSamples() == len, "and the recording keeps its length");
+
+        auto half = engine::straighten (wobbly, rate, bpm, 0.5f, false);
+        const double mid = worstError (half);
+        std::cout << "     at 50%: " << juce::String (mid, 1) << " ms\n";
+        CHECK (mid < before * 0.75 && mid > after, "at 50% it keeps half of the human feel");
+
+        // an empty result is the engine saying "nothing to do" - the caller then keeps the original
+        auto none = engine::straighten (wobbly, rate, bpm, 0.0f, false);
+        CHECK (none.getNumSamples() == 0, "at 0% nothing is touched");
+
+        // the same, without changing the pitch. A phase vocoder softens a click, so the onset
+        // detector is no judge here: we look at where the energy actually sits.
+        auto worstPeakError = [&] (const juce::AudioBuffer<float>& b)
+        {
+            const int win = (int) (beatLen * 0.30);
+            double worst = 0.0;
+            for (int k = 1; k < beats; ++k)
+            {
+                const int want = (int) std::llround (k * beatLen);
+                int bestPos = want;
+                float best = 0.0f;
+                for (int i = juce::jmax (0, want - win); i < juce::jmin (b.getNumSamples(), want + win); ++i)
+                {
+                    float e = 0.0f;
+                    for (int j = 0; j < 128 && i + j < b.getNumSamples(); ++j)
+                        e += std::abs (b.getSample (0, i + j));
+                    if (e > best) { best = e; bestPos = i; }
+                }
+                worst = juce::jmax (worst, (double) std::abs (bestPos - want));
+            }
+            return worst / rate * 1000.0;
+        };
+        const double peakBefore = worstPeakError (wobbly);
+        auto smooth = engine::straighten (wobbly, rate, bpm, 1.0f, true);
+        const double peakAfter = worstPeakError (smooth);
+        std::cout << "     smooth (vocal) mode: " << juce::String (peakBefore, 1) << " ms before, "
+                  << juce::String (peakAfter, 1) << " ms after\n";
+        CHECK (peakAfter < peakBefore * 0.4, "the smooth (vocal) mode straightens too");
+        CHECK (smooth.getNumSamples() == len && smooth.getMagnitude (0, 0, len) > 0.05f, "and it is not silent");
+
+        // a machine-made loop is already straight: leave it exactly as it is
+        juce::AudioBuffer<float> perfect (2, len);
+        perfect.clear();
+        for (int k = 0; k < beats; ++k) clickAt (perfect, (int) std::llround (k * beatLen), k % 4 == 0 ? 0.9f : 0.55f);
+        auto same = engine::straighten (perfect, rate, bpm, 1.0f, false);
+        float diff = 0.0f;
+        if (same.getNumSamples() == len)
+            for (int i = 0; i < len; i += 7) diff = juce::jmax (diff, std::abs (same.getSample (0, i) - perfect.getSample (0, i)));
+        std::cout << "     already straight: " << (same.getNumSamples() == 0 ? juce::String ("left alone")
+                                                                             : "biggest change " + juce::String (diff, 4)) << "\n";
+        CHECK (same.getNumSamples() == 0 || diff < 0.02f, "a loop that is already on the grid comes back untouched");
+
+        // something with no beat at all must not be mangled
+        juce::AudioBuffer<float> pad (2, len);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < len; ++i)
+                pad.setSample (ch, i, (float) (0.25 * std::sin (juce::MathConstants<double>::twoPi * 220.0 * i / rate)));
+        int padBeats = 0;
+        engine::findBeats (pad, rate, bpm, padBeats);
+        CHECK (padBeats == 0, "a pad has no beats to pull straight");
+        CHECK (engine::straighten (pad, rate, bpm, 1.0f, false).getNumSamples() == 0, "and it comes back untouched");
+
+        // a take that is not a whole number of beats long must still land on the grid
+        {
+            const int oddLen = (int) std::llround (beatLen * 13.4);
+            juce::AudioBuffer<float> odd (2, oddLen);
+            odd.clear();
+            for (int k = 0; k * beatLen < oddLen - 2000; ++k)
+            {
+                const double drift = std::sin (k * 0.8) * beatLen * 0.05;
+                clickAt (odd, (int) std::llround (k * beatLen + drift), k % 4 == 0 ? 0.9f : 0.55f);
+            }
+            auto fixed = engine::straighten (odd, rate, bpm, 1.0f, false);
+            double worst = 0.0;
+            if (fixed.getNumSamples() == oddLen)
+            {
+                auto on = engine::detectOnsets (fixed, beatLen, 0.6f);
+                for (int o : on)
+                {
+                    const double k = std::round (o / beatLen);
+                    if (k < 1.0 || k * beatLen > oddLen - 2000) continue;
+                    worst = juce::jmax (worst, std::abs (o - k * beatLen) / rate * 1000.0);
+                }
+            }
+            std::cout << "     odd length (13.4 beats): worst " << juce::String (worst, 1) << " ms\n";
+            CHECK (fixed.getNumSamples() == oddLen && worst < 6.0, "an odd-length take lands on the grid too");
+        }
+    }
+
     std::cout << (failures == 0 ? "\nALL TESTS PASSED\n" : "\nFAILURES: ") << (failures == 0 ? "" : juce::String (failures).toStdString()) << "\n";
     return failures == 0 ? 0 : 1;
 }

@@ -22,6 +22,7 @@ struct SlotInfo
     int transpose = 0;
     float weight = 1.0f;
     float trimStart = 0.0f, trimEnd = 1.0f;
+    float warp = 0.0f;
     bool reference = false;
     double stretchRatio = 1.0;
     std::vector<float> peaks;
@@ -88,6 +89,8 @@ public:
     void setSlotWeight (int slot, float weight);       // 0..2: share of the slices coming from this sample
     /** The two lines on a slot: slices are only taken from between them (0..1 of the sample). */
     void setSlotTrim (int slot, float start, float end);
+    /** Pulls a human recording onto the grid: 0 = as recorded, 1 = dead straight. */
+    void setSlotWarp (int slot, float amount);
     /** kTrackSlot when a part of your own track is loaded (FIT TO TRACK), otherwise -1. */
     int  getReferenceSlot() const noexcept { return referenceSlot.load(); }
     /** Where the sample preview is playing, 0..1 of the whole sample (-1 = not playing). */
@@ -101,6 +104,7 @@ public:
 
     using ParamMap = std::map<juce::String, float>;
     void generateNew (const ParamMap* settingsBefore = nullptr);
+    void resetSettings();                    // every knob back to its default (CLEAR ALL)
     void crazyLoop (int flavour);   // the skin's "craziest loop ever" (flavour = skin index)
     void mutate();                  // a variation: 20-30% of the unlocked slices change
     void rerollRhythm();            // new rhythm, same sources
@@ -226,6 +230,12 @@ private:
     std::array<int, kAllSlots>          slotGeneration {};
     std::array<juce::MemoryBlock, kAllSlots> embeddedAudio;   // compressed copy kept for the project file
     std::array<PreparedSlot, kAllSlots> prepared;             // worker thread only
+    // straightened copies, made once per (file, tempo, amount) - worker thread only
+    std::array<std::shared_ptr<const juce::AudioBuffer<float>>, kAllSlots> warpedAudio;
+    struct WarpKey { int loadId = -1; double bpm = 0.0; float amount = -1.0f; bool smooth = false; bool done = false; };
+    std::array<WarpKey, kAllSlots> warpedKey;
+    // the same straightened copy, handed to the message thread so preview plays what you will hear
+    std::array<std::shared_ptr<const juce::AudioBuffer<float>>, kAllSlots> warpedShared;   // guarded by slotLock
     int nextLoadId = 1;
 
     mutable juce::CriticalSection arrangementLock;
@@ -269,11 +279,12 @@ private:
     std::atomic<double> hostBpm { defaultBpm }, fallbackBpm { defaultBpm }, currentRate { 0.0 }, playPosition { -1.0 };
     std::atomic<bool> standaloneStateRestored { false };   // the standalone reloads its last session once
     std::atomic<bool> editorEverOpened { false };          // ... and it does that before the window exists
-    std::atomic<bool> keyRestoreWanted { false }, trackRegrid { false };
+    std::atomic<bool> keyRestoreWanted { false }, trackRegrid { false }, warpPreviewRearm { false };
     std::atomic<double> slotPreviewPos { -1.0 };
     void handleAsyncUpdate() override;
     void restoreKeyAfterReference();
     void regridTrack();                      // worker thread
+    void publishWarped (int slot);           // worker thread: hand the straightened copy over for preview
     /** Changes a slot's settings, also on a file that is still loading. Call with slotLock held. */
     template <typename Fn>
     void editSlotState (int slot, Fn&& fn)

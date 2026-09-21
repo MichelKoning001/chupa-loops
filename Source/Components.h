@@ -154,13 +154,13 @@ public:
     juce::String lockedTag;   // e.g. "SYNC" when the host sets the value
     std::function<juce::String (double)> format;
     std::function<void (double)> onChange, onDragEnd;
-    std::function<void()> onReset;
+    std::function<void()> onReset, onClick;   // onClick: a plain click that did not drag
     juce::Colour colour = colours::text();
 
 private:
     void showEditor();
     double value = 0, dragStartValue = 0;
-    bool dragging = false;
+    bool dragging = false, nudged = false;
     std::unique_ptr<juce::TextEditor> editor;
 };
 
@@ -213,7 +213,7 @@ private:
     float trimA = 0.0f, trimB = 1.0f;             // what the UI shows while you drag
     double previewPos = -1.0;
 
-    DragNumber bpmField, transposeField, weightField;
+    DragNumber bpmField, transposeField, weightField, warpField;
     juce::TextButton powerButton, clearButton, playButton;
     std::unique_ptr<juce::FileChooser> chooser;
 };

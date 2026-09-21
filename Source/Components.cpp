@@ -498,17 +498,20 @@ void DragNumber::paint (juce::Graphics& g)
     g.drawFittedText (format ? format (value) : juce::String (value), textArea, juce::Justification::centred, 1);
 }
 
-void DragNumber::mouseDown (const juce::MouseEvent&)
+void DragNumber::mouseDown (const juce::MouseEvent& e)
 {
-    if (locked) return;
+    if (locked || e.mods.isPopupMenu()) return;   // a right-click belongs to the slot's menu
     dragStartValue = value;
     dragging = true;
+    nudged = false;
     repaint();
 }
 
 void DragNumber::mouseDrag (const juce::MouseEvent& e)
 {
     if (locked || ! dragging) return;
+    if (std::abs (e.getDistanceFromDragStartY()) >= 2)
+        nudged = true;                            // a nudge against the end stop is not a click
     const double sens = e.mods.isShiftDown() ? 0.2 : 1.0;
     const double steps = std::round (-e.getDistanceFromDragStartY() / pixelsPerStep * sens);
     const double v = juce::jlimit (minValue, maxValue, dragStartValue + steps * step);
@@ -520,13 +523,17 @@ void DragNumber::mouseDrag (const juce::MouseEvent& e)
     }
 }
 
-void DragNumber::mouseUp (const juce::MouseEvent&)
+void DragNumber::mouseUp (const juce::MouseEvent& e)
 {
-    if (locked) return;
+    if (locked || e.mods.isPopupMenu()) return;
+    const bool wasNudged = nudged;
     dragging = false;
+    nudged = false;
     repaint();
     if (onDragEnd && value != dragStartValue)   // a plain click never turns "auto" into a manual value
         onDragEnd (value);
+    else if (onClick && e.mouseWasClicked() && e.getNumberOfClicks() == 1 && ! wasNudged)
+        onClick();   // not the second click of a double-click, and not a nudge that hit the end stop
 }
 
 void DragNumber::mouseDoubleClick (const juce::MouseEvent&)
@@ -615,6 +622,17 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
         : juce::String ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%."));
     addAndMakeVisible (weightField);
 
+    warpField.minValue = 0; warpField.maxValue = 100; warpField.step = 5; warpField.pixelsPerStep = 2;
+    warpField.format = [] (double v) { return v < 0.5 ? juce::String ("STR") : juce::String ((int) v) + "%"; };
+    warpField.onDragEnd = [this] (double v) { proc.setSlotWarp (index, (float) (v / 100.0)); };
+    warpField.onClick = [this] { proc.setSlotWarp (index, info.warp > 0.001f ? 0.0f : 1.0f); };
+    warpField.onReset = [this] { proc.setSlotWarp (index, 0.0f); };
+    warpField.setTooltip ("STRAIGHT: pulls a human recording onto the grid - an old record, a live take, a vocal.\n"
+                          "Click to switch it on, drag up/down for how far: 100% is dead straight, "
+                          "60% takes the wobble out and keeps the feel.\nDouble-click = off.\n"
+                          "STRETCH on Smooth keeps the pitch (use that for vocals), on Beats the pitch rides along like on vinyl.");
+    addAndMakeVisible (warpField);
+
     playButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb6"));
     playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping) - only the part between the two lines.\nClick again to stop.");
     playButton.onClick = [this] { proc.setSlotPreview (index); };
@@ -656,6 +674,10 @@ void SlotComponent::refresh (const SlotInfo& i)
     transposeField.setVisible (show && ! isTrack());
     playButton.setVisible (show);
     weightField.setVisible (show);
+    warpField.setVisible (show && ! isTrack());   // your own track is already on the grid
+    warpField.setValue (juce::roundToInt (info.warp * 100.0f));
+    warpField.highlighted = info.warp > 0.001f;
+    warpField.colour = colours::cyan();
     if (dragHandle < 0)
     {
         trimA = juce::jlimit (0.0f, 0.99f, info.trimStart);
@@ -727,6 +749,7 @@ void SlotComponent::resized()
     bpmField.setBounds (bottom.removeFromRight (74));
     clearButton.setBounds (getWidth() - 30, 8, 20, 20);
     weightField.setBounds (getWidth() - 82, 8, 46, 20);
+    warpField.setBounds   (getWidth() - 132, 8, 44, 20);
 }
 
 /** The strip the waveform is drawn in: where the two cut lines live. */
@@ -857,39 +880,47 @@ void SlotComponent::paint (juce::Graphics& g)
     }
 
     // title row: name ... [key] [+x%]
-    auto tags = title.withTrimmedRight (isTrack() ? 28.0f : 112.0f);   // room for the fields and the clear button
+    auto tags = title.withTrimmedRight (isTrack() ? 28.0f : 128.0f);   // room for the fields and the clear button
+    const float minName = 42.0f;   // the name always keeps this much room: a tag that does not fit is dropped
+    const auto tagFont = uiFont (9.5f, 1);
     auto drawTag = [&] (const juce::String& t, juce::Colour c)
     {
-        const float w = juce::GlyphArrangement::getStringWidth (uiFont (10.5f, 1), t) + 10.0f;
+        const float w = juce::GlyphArrangement::getStringWidth (tagFont, t) + 8.0f;
+        if (tags.getWidth() - w - 4.0f < minName)
+            return;
         auto tr = tags.removeFromRight (w).reduced (0, 2);
         tags.removeFromRight (4.0f);
         g.setColour (c.withAlpha (0.16f));
         g.fillRoundedRectangle (tr, 3.0f);
         g.setColour (c);
-        g.setFont (uiFont (10.5f, 1));
+        g.setFont (tagFont);
         g.drawText (t, tr, juce::Justification::centred);
     };
-    const double stretchPct = (info.stretchRatio - 1.0) * 100.0;
-    if (std::abs (stretchPct) >= 0.5)
-        drawTag ((stretchPct > 0 ? "+" : "") + juce::String (juce::roundToInt (stretchPct)) + "%", colours::dim());
+    // the key comes first: it is the one that tells you something (the stretch tag is a nicety)
     if (info.key >= 0)
     {
         const int shifted = info.keyShift != 0 ? (((info.key / 2 + info.keyShift) % 12 + 12) % 12) * 2 + (info.key % 2) : info.key;
-        drawTag (engine::keyName (info.key) + (info.keyShift != 0 ? juce::String::fromUTF8 (" \xe2\x86\x92 ") + engine::keyName (shifted) : juce::String()),
+        drawTag (engine::keyName (info.key) + (info.keyShift != 0 ? juce::String::fromUTF8 ("\xe2\x86\x92") + engine::keyName (shifted) : juce::String()),
                  info.keyShift != 0 ? colours::cyan() : colours::dim());
     }
+    const double stretchPct = (info.stretchRatio - 1.0) * 100.0;
+    if (std::abs (stretchPct) >= 0.5)
+        drawTag ((stretchPct > 0 ? "+" : "") + juce::String (juce::roundToInt (stretchPct)) + "%", colours::dim());
 
     if (isTrack())
     {
         const auto f = uiFont (10.0f, 2);
         const float w = juce::GlyphArrangement::getStringWidth (f, "MY TRACK") + 12.0f;
-        auto tag = tags.removeFromLeft (w).withSizeKeepingCentre (w, 16.0f);
-        tags.removeFromLeft (8.0f);
-        g.setColour (col.withAlpha (skin().light ? 0.20f : 0.16f));
-        g.fillRoundedRectangle (tag, 4.0f);
-        g.setColour (skin().light ? col.darker (0.3f) : col);
-        g.setFont (f);
-        g.drawText ("MY TRACK", tag, juce::Justification::centred);
+        if (tags.getWidth() - w - 8.0f >= minName)     // no room for both? then the file name wins
+        {
+            auto tag = tags.removeFromLeft (w).withSizeKeepingCentre (w, 16.0f);
+            tags.removeFromLeft (8.0f);
+            g.setColour (col.withAlpha (skin().light ? 0.20f : 0.16f));
+            g.fillRoundedRectangle (tag, 4.0f);
+            g.setColour (skin().light ? col.darker (0.3f) : col);
+            g.setFont (f);
+            g.drawText ("MY TRACK", tag, juce::Justification::centred);
+        }
     }
     g.setColour (active ? colours::text() : colours::faint());
     g.setFont (uiFont (12.5f, 1));

@@ -865,6 +865,77 @@ int main (int argc, char** argv)
             waitFor (*proc, proc->getResultVersion());
         }
 
+        // NEW LOOP straight after a crazy button must land on a normal loop again - every skin
+        {
+            const juce::StringArray watched { "pattern", "style", "amount", "sliceSize", "sliceMode", "sensitivity",
+                                              "chaos", "reverse", "octave", "swing", "gate", "fade", "motif", "variation" };
+            auto snap = [&]
+            {
+                std::map<juce::String, float> m;
+                for (auto& id : watched) m[id] = proc->apvts.getRawParameterValue (id)->load();
+                return m;
+            };
+            for (int sk = 0; sk < numSkins; ++sk)
+            {
+                const auto normal = snap();
+                proc->crazyLoop (sk);
+                pump();
+                waitFor (*proc, proc->getResultVersion());
+                const auto crazy = snap();
+                proc->generateNew();
+                pump();
+                waitFor (*proc, proc->getResultVersion());
+                const auto back = snap();
+                juce::String off;
+                for (auto& id : watched)
+                    if (std::abs (back.at (id) - normal.at (id)) > 1.0e-3f)
+                        off += (off.isEmpty() ? "" : ", ") + id + " " + juce::String (normal.at (id), 2)
+                             + " -> " + juce::String (back.at (id), 2);
+                bool moved = false;
+                for (auto& id : watched) moved |= std::abs (crazy.at (id) - normal.at (id)) > 1.0e-3f;
+                CHECK (moved && off.isEmpty(), "NEW LOOP after " + skinAt (sk).crazyName + " is normal again"
+                                               + (off.isEmpty() ? juce::String() : "  [" + off + "]"));
+            }
+
+            // and after hitting the crazy button three times in a row, NEW LOOP still lands on normal
+            {
+                const auto normal = snap();
+                proc->crazyLoop (skinSmile);
+                pump(); waitFor (*proc, proc->getResultVersion());
+                proc->crazyLoop (skinSkull);
+                pump(); waitFor (*proc, proc->getResultVersion());
+                proc->crazyLoop (skinSmile);
+                pump(); waitFor (*proc, proc->getResultVersion());
+                proc->generateNew();
+                pump(); waitFor (*proc, proc->getResultVersion());
+                const auto back = snap();
+                juce::String off;
+                for (auto& id : watched)
+                    if (std::abs (back.at (id) - normal.at (id)) > 1.0e-3f)
+                        off += (off.isEmpty() ? "" : ", ") + id;
+                CHECK (off.isEmpty(), "three crazy buttons in a row: NEW LOOP is still normal again"
+                                      + (off.isEmpty() ? juce::String() : "  [" + off + "]"));
+            }
+        }
+
+        // CLEAR ALL puts every knob back to its default too
+        {
+            setParam ("chaos", 0.9f);
+            setParam ("swing", 0.6f);
+            proc->crazyLoop (skinSmile);
+            pump(); waitFor (*proc, proc->getResultVersion());
+            proc->resetSettings();
+            pump();
+            juce::String off;
+            for (auto& id : presetParameterIds())
+                if (auto* prm = proc->apvts.getParameter (id))
+                    if (std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-3f)
+                        off += (off.isEmpty() ? "" : ", ") + id;
+            CHECK (off.isEmpty(), "CLEAR ALL puts every knob back to normal"
+                                  + (off.isEmpty() ? juce::String() : "  [" + off + "]"));
+            waitFor (*proc, proc->getResultVersion());
+        }
+
         // scenes
         {
             auto sceneA = proc->getDisplayResult();
@@ -1325,6 +1396,41 @@ int main (int argc, char** argv)
         CHECK (! p17->getSlotInfo (1).loaded, "and is not left in its old slot as well");
     }
 
+    // ---- a sample dropped in later joins the loop straight away, without pressing NEW LOOP
+    {
+        auto p24 = std::make_unique<SliceTribeProcessor>();
+        p24->prepareToPlay (48000.0, 512);
+        p24->loadSlot (0, files[0]);
+        for (int t = 0; t < 100 && ! p24->getSlotInfo (0).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        for (int t = 0; t < 100 && p24->getDisplayResult() == nullptr; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        const int v0 = p24->getResultVersion();
+        auto used = [] (const SliceTribeProcessor& p, int slot)
+        {
+            auto r = p.getDisplayResult();
+            if (r == nullptr) return 0;
+            int n = 0;
+            for (auto& sg : r->segments) n += sg.slot == slot ? 1 : 0;
+            return n;
+        };
+        const int before1 = used (*p24, 1);
+        p24->loadSlot (1, files[1]);
+        for (int t = 0; t < 120 && (! p24->getSlotInfo (1).loaded || p24->getResultVersion() == v0); ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        const int after1 = used (*p24, 1);
+        std::cout << "     slices from the new sample: " << before1 << " -> " << after1 << "\n";
+        CHECK (before1 == 0 && after1 > 0, "a sample dropped in later is used right away");
+
+        // and the same for the third one, while the first two keep playing
+        const int v1 = p24->getResultVersion();
+        p24->loadSlot (2, files[2]);
+        for (int t = 0; t < 120 && (! p24->getSlotInfo (2).loaded || p24->getResultVersion() == v1); ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (used (*p24, 2) > 0 && used (*p24, 0) > 0 && used (*p24, 1) > 0,
+               "and a third one joins them, all three in the same loop");
+    }
+
     // ---- the two cut lines: only that part of the sample is used, and it survives the project
     {
         auto p18 = std::make_unique<SliceTribeProcessor>();
@@ -1371,6 +1477,59 @@ int main (int argc, char** argv)
             juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
         CHECK (std::abs (p19->getSlotInfo (0).trimStart - 0.5f) < 0.001f
             && std::abs (p19->getSlotInfo (0).trimEnd - 0.75f) < 0.001f, "and they come back with the project");
+    }
+
+    // ---- STRAIGHT: a crooked recording is pulled onto the grid, and it survives the project
+    {
+        const double rate = 48000.0, bpm = 120.0, beatLen = rate * 60.0 / bpm;
+        const int beats = 16, len = (int) std::llround (beats * beatLen);
+        auto crooked = out.getChildFile ("Wobbly_Disco_120bpm.wav");
+        {
+            juce::AudioBuffer<float> b (2, len);
+            b.clear();
+            for (int k = 0; k < beats; ++k)
+            {
+                const double off = (std::sin (k * 1.9) * 0.016 + (k % 3 == 0 ? 0.008 : -0.006)) * rate * (0.4 + 0.6 * k / beats);
+                const int pos = juce::jlimit (0, len - 1, (int) std::llround (k * beatLen + off));
+                const int n = (int) (rate * 0.035);
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int i = 0; i < n && pos + i < len; ++i)
+                    {
+                        const double t = i / rate;
+                        b.addSample (ch, pos + i, (float) (std::sin (juce::MathConstants<double>::twoPi * 70.0 * t)
+                                                           * std::exp (-t * 45.0) * (k % 4 == 0 ? 0.9 : 0.55)));
+                    }
+            }
+            engine::writeWav (crooked, b, rate, 1.0f);
+        }
+
+        FakeHost h23; h23.bpm = 120.0;
+        auto p23 = std::make_unique<SliceTribeProcessor>();
+        p23->setPlayHead (&h23);
+        p23->prepareToPlay (rate, 512);
+        runHost (*p23, h23, 0.05, nullptr);
+        p23->loadSlot (0, crooked);
+        waitFor (*p23, 1, 30000);
+        CHECK (std::abs (p23->getSlotInfo (0).detectedBpm - 120.0) < 1.0, "the wobbly recording is heard at 120 bpm");
+        CHECK (p23->getSlotInfo (0).warp < 0.001f, "a sample starts as recorded");
+
+        const int v23 = p23->getResultVersion();
+        p23->setSlotWarp (0, 1.0f);
+        CHECK (waitFor (*p23, v23 + 1, 40000), "the loop is rebuilt when you straighten a sample");
+        CHECK (std::abs (p23->getSlotInfo (0).warp - 1.0f) < 0.001f, "STRAIGHT is stored on the slot");
+
+        juce::MemoryBlock st23;
+        p23->getStateInformation (st23);
+        auto p24 = std::make_unique<SliceTribeProcessor>();
+        p24->prepareToPlay (rate, 512);
+        p24->setStateInformation (st23.getData(), (int) st23.getSize());
+        for (int t = 0; t < 100 && ! p24->getSlotInfo (0).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (std::abs (p24->getSlotInfo (0).warp - 1.0f) < 0.001f, "and it comes back with the project");
+
+        p23->setSlotWarp (0, 0.0f);
+        waitFor (*p23, p23->getResultVersion() + 1, 40000);
+        CHECK (p23->getSlotInfo (0).warp < 0.001f, "and you can put it back to as recorded");
     }
 
     // ---- FIT at 0% is a real setting and must survive a save
