@@ -733,7 +733,10 @@ int main (int argc, char** argv)
                 const double after3 = motifRepeats (*proc->getDisplayResult());
                 std::cout << "     motif repeats: " << juce::String (before3 * 100, 0) << "% before SRC, "
                           << juce::String (after3 * 100, 0) << "% after\n";
-                CHECK (before3 > 0.7 && after3 > 0.7, "SRC keeps the motif repeat");
+                // with more samples loaded than there are slices in one repeat, a couple of slices
+                // carry a sample that would otherwise never be heard, so the repeat is not 100%.
+                // What matters here is that SRC does not make it any worse.
+                CHECK (before3 > 0.7 && after3 >= before3 - 0.01, "SRC keeps the motif repeat");
                 setParam ("motif", 2); setParam ("variation", 20);
                 waitFor (*proc, proc->getResultVersion() + 1);
             }

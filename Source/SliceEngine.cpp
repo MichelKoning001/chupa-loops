@@ -1458,7 +1458,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
     };
 
     // ---------------------------------------------------------------- 1. decide every hit
-    std::vector<Choice> choicesOut;
+    std::vector<Choice> choicesOut, fitSkipped;
     choicesOut.reserve (hits.size());
 
     // a fill is played whatever your own track is doing
@@ -1510,25 +1510,55 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         }
     }
 
-    for (size_t h = 0; h < hits.size(); ++h)
+    // which sample this hit draws from, and whether a repeat makes it copy an earlier hit
+    auto seedForHit = [&] (size_t h, size_t& baseOut)
     {
         const auto& hit = hits[h];
         const juce::uint64 own = h < arr.hitSeeds.size() ? arr.hitSeeds[h] : hashCombine (arr.seed, h);
         const bool isLocked = h < arr.locked.size() && arr.locked[h];
         const bool forced   = h < arr.forceOwn.size() && arr.forceOwn[h];
-
+        baseOut = h;
         juce::uint64 seedToUse = own;
         if (motifActive && hit.bar >= M && ! isLocked && ! forced)
         {
             juce::uint64 t = own;
-            const double uVar = uniform (t);
-            if (uVar >= s.variation)
+            if (uniform (t) >= s.variation)
             {
                 const size_t base = barFirst[(size_t) (hit.bar % M)] + (size_t) hit.localIndex;
                 if (base < arr.hitSeeds.size())
+                {
                     seedToUse = arr.hitSeeds[base];
+                    baseOut = base;
+                }
             }
         }
+        return seedToUse;
+    };
+
+    // every sample has a share: its weight (0 = never, 1 = normal, 2 = twice as often)
+    auto pickSlot = [&] (double slotDraw)
+    {
+        double total = 0.0;
+        for (int a2 : active) total += juce::jmax (0.0f, slots[(size_t) a2].weight);
+        if (total <= 1.0e-6)
+            return active[(size_t) juce::jmin ((int) active.size() - 1, (int) (slotDraw * active.size()))];
+        double x = slotDraw * total, acc = 0.0;
+        for (int a2 : active)
+        {
+            acc += juce::jmax (0.0f, slots[(size_t) a2].weight);
+            if (x < acc) return a2;
+        }
+        return active.back();
+    };
+
+    for (size_t h = 0; h < hits.size(); ++h)
+    {
+        const auto& hit = hits[h];
+        const bool isLocked = h < arr.locked.size() && arr.locked[h];
+
+        size_t copiedFrom = h;
+        const juce::uint64 seedToUse = seedForHit (h, copiedFrom);   // a repeat copies an earlier hit
+        juce::ignoreUnused (copiedFrom);
 
         juce::uint64 st = seedToUse;
         uniform (st);
@@ -1554,26 +1584,11 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         const juce::int64 lenOut = juce::jmax<juce::int64> (32, std::llround ((endPos - startPos) * s.gate));
 
         // position inside a source, in beats
-        auto choose = [&] (double slotDraw, double posDraw, bool keepPosition, bool octaveOn, int& slotOut, double& beatsOut)
+        auto choose = [&] (double slotDraw, double posDraw, bool keepPosition, bool octaveOn, int& slotOut, double& beatsOut,
+                           int forceSlot = -1)
         {
-            {
-                // every sample has a share: its weight (0 = never, 1 = normal, 2 = twice as often)
-                double total = 0.0;
-                for (int a2 : active) total += juce::jmax (0.0f, slots[(size_t) a2].weight);
-                int picked = active.back();
-                if (total > 1.0e-6)
-                {
-                    double x = slotDraw * total, acc = 0.0;
-                    for (int a2 : active)
-                    {
-                        acc += juce::jmax (0.0f, slots[(size_t) a2].weight);
-                        if (x < acc) { picked = a2; break; }
-                    }
-                }
-                else
-                    picked = active[(size_t) juce::jmin ((int) active.size() - 1, (int) (slotDraw * active.size()))];
-                slotOut = picked;
-            }
+            // a reserved hit belongs to a sample that would otherwise never be heard
+            slotOut = forceSlot >= 0 ? forceSlot : pickSlot (slotDraw);
             const auto& ps = slots[(size_t) slotOut];
             const auto& src = bufferOf (slotOut, octaveOn);
             const double bl = beatLenOf (slotOut, octaveOn);
@@ -1709,14 +1724,16 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
                 c.glitchDiv = ks[juce::jlimit (0, 4, (int) (uK * (2.0 + 3.0 * s.amount)))];
             }
         }
-        // FIT TO TRACK: skip hits that land where your own track is already busy
+        // FIT TO TRACK: skip hits that land where your own track is already busy. The slice is
+        // still worked out, and kept aside: if a sample would otherwise not be heard at all, one
+        // of these comes back below.
+        bool fitSkip = false;
         if (s.fit > 0.001f && ! isLocked && ! fitProtected[h] && ! inFill (hit))   // a fill always stays
         {
             const int step = ((int) std::llround (hit.startStep)) % 16;
             const float busy = s.fitProfile[(size_t) juce::jlimit (0, 15, step)];
             juce::uint64 ft = hashCombine (rt, 0xF17ull);
-            if (busy > 0.35f && uniform (ft) < juce::jlimit (0.0, 0.95, (double) (s.fit * (busy - 0.35f) / 0.65f)))
-                continue;   // leave this spot to the track
+            fitSkip = busy > 0.35f && uniform (ft) < juce::jlimit (0.0, 0.95, (double) (s.fit * (busy - 0.35f) / 0.65f));
         }
 
         // energy: the further into the loop, the more glitch, octaves and reverses
@@ -1750,7 +1767,102 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
                 c.reversed = false;
             }
         }
-        choicesOut.push_back (c);
+        (fitSkip ? fitSkipped : choicesOut).push_back (c);
+    }
+
+
+    // Every loaded sample should be heard. Which sample a slice takes is drawn per slice, so with
+    // few slices (big slices, a short repeat, FIT thinning them out) a sample can draw nothing at
+    // all - a sample you just dropped in then seems to be ignored. Rather than steer the draw, we
+    // look at the result: a sample that came up empty takes over one slice from the sample with the
+    // most, or gets back a slice FIT took away. Locked slices are never touched. With fewer slices
+    // than samples not everyone can be given one; then the ones that can, are.
+    {
+        std::array<int, kNumSlots> got {};
+        for (const auto& c : choicesOut)
+            if (juce::isPositiveAndBelow (c.slot, kNumSlots))
+                ++got[(size_t) c.slot];
+
+        double totalWeight = 0.0;
+        for (int a2 : active) totalWeight += juce::jmax (0.0f, slots[(size_t) a2].weight);
+        const bool weightsOff = totalWeight <= 1.0e-6;   // every share at 0: then they all play
+
+        // start on a transient of the new sample, so the rescued slice is never a piece of silence
+        auto giveSlice = [&] (Choice& c, int toSlot)
+        {
+            const auto& ps = slots[(size_t) toSlot];
+            const auto& src = bufferOf (toSlot, false);
+            const double bl = juce::jmax (1.0, beatLenOf (toSlot, false));
+            const double srcBeats = src.getNumSamples() / bl;
+            const double fa = juce::jlimit (0.0, 1.0, (double) ps.trimStart);
+            const double fb = juce::jlimit (fa, 1.0, (double) ps.trimEnd);
+            double at = fa * srcBeats;
+            for (int o : ps.onsets)
+            {
+                const double ob = o / bl;
+                if (ob >= fa * srcBeats && ob <= fb * srcBeats - 0.05) { at = ob; break; }
+            }
+            c.slot = toSlot;
+            c.octave = false;
+            c.glitch = 0;
+            c.srcBeats = juce::jlimit (0.0, juce::jmax (0.0, srcBeats - 0.05), at);
+        };
+
+        for (int a2 : active)
+        {
+            if (got[(size_t) a2] > 0 || (! weightsOff && slots[(size_t) a2].weight <= 0.001f))
+                continue;
+
+            // the samples with the most to spare first, and keep trying: the fattest one may have
+            // nothing but locked or glitched slices
+            std::vector<int> donors;
+            for (int b2 : active)
+                if (got[(size_t) b2] > 1)
+                    donors.push_back (b2);
+            std::stable_sort (donors.begin(), donors.end(),
+                              [&] (int x, int y) { return got[(size_t) x] > got[(size_t) y]; });
+
+            bool given = false;
+            for (int pass = 0; pass < 2 && ! given; ++pass)      // a plain slice first, a glitched one if need be
+                for (int from : donors)
+                {
+                    for (size_t k = choicesOut.size(); k-- > 0;)
+                    {
+                        auto& c = choicesOut[k];
+                        if (c.slot != from || c.locked || (pass == 0 && c.glitch))
+                            continue;
+                        giveSlice (c, a2);
+                        --got[(size_t) from];
+                        ++got[(size_t) a2];
+                        given = true;
+                        break;
+                    }
+                    if (given)
+                        break;
+                }
+            if (given || fitSkipped.empty())
+                continue;   // nothing to spare and nothing set aside: this one has to wait
+
+            // FIT has taken nearly everything: put one slice back, the one on the quietest spot
+            // in your own track, so FIT stays as intact as it can
+            size_t pick = fitSkipped.size();
+            float quietest = 2.0f;
+            for (size_t k = 0; k < fitSkipped.size(); ++k)
+            {
+                const int step = juce::jlimit (0, 15, (int) (fitSkipped[k].outStart / juce::jmax (1.0, stepLen)) % 16);
+                const float busy = s.fitProfile[(size_t) step] + (fitSkipped[k].glitch ? 1.0f : 0.0f);
+                if (busy < quietest) { quietest = busy; pick = k; }
+            }
+            if (pick >= fitSkipped.size())
+                continue;
+            Choice c = fitSkipped[pick];
+            fitSkipped.erase (fitSkipped.begin() + (long) pick);
+            giveSlice (c, a2);
+            auto at = std::lower_bound (choicesOut.begin(), choicesOut.end(), c.outStart,
+                                        [] (const Choice& x, juce::int64 v) { return x.outStart < v; });
+            choicesOut.insert (at, c);
+            ++got[(size_t) a2];
+        }
     }
 
     // ---------------------------------------------------------------- 2. cut hits into pieces

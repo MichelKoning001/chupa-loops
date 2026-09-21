@@ -1,4 +1,5 @@
 // Offline test tool: creates test basslines, runs the engine, writes WAVs and checks timing.
+#include <set>
 #include <JuceHeader.h>
 #include "SliceEngine.h"
 #include <cmath>
@@ -356,6 +357,51 @@ int main()
                && perBar[0] < (int) r->segments.size() / 2, "slices are taken from the whole loop");
     }
 
+    // ---------------------------------------------- every loaded sample is actually heard
+    // (big slices + a one-bar repeat + FIT leave very few draws; a sample must not fall out)
+    {
+        int loaded = 0;
+        for (int i = 0; i < kNumSlots; ++i)
+            if (prepared[(size_t) i].audio != nullptr) ++loaded;
+
+        for (int fitOn = 0; fitOn < 3; ++fitOn)
+        {
+            Settings s;
+            s.bars = 4;
+            s.pattern = patFree;
+            s.sliceSteps = 4.0;     // 1/4 slices: 16 hits for 6 samples
+            s.motifBars = 1;        // and bars 2-4 are a copy of bar 1
+            s.variation = 0.0f;
+            if (fitOn == 1)
+            {
+                s.fit = 2.0f;                                   // FIT all the way up ...
+                for (auto& v : s.fitProfile) v = 0.9f;          // ... on a track that is busy everywhere
+            }
+            if (fitOn == 2)
+            {
+                s.style = styleGlitch;                          // and everything glitched to bits
+                s.amount = 1.0f;
+            }
+            int worstMissing = 0, seedsWithHoles = 0;
+            for (juce::uint64 seed = 1; seed <= 40; ++seed)
+            {
+                Arrangement a; a.seed = seed;
+                auto hits = engine::buildHits (s, a.seed);
+                a.resizeFor (hits.size());
+                a.regenerate (seed);
+                auto r = engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+                std::set<int> used;
+                for (auto& sg : r->segments) used.insert (sg.slot);
+                const int missing = loaded - (int) used.size();
+                if (missing > 0) { ++seedsWithHoles; worstMissing = juce::jmax (worstMissing, missing); }
+            }
+            const juce::String what = fitOn == 0 ? "plain" : fitOn == 1 ? "FIT 200%" : "Glitch 100%";
+            std::cout << "     " << loaded << " samples, " << what
+                      << ": seeds where one is never heard " << seedsWithHoles << "/40 (worst " << worstMissing << ")\n";
+            CHECK (seedsWithHoles == 0, "every loaded sample gets a slice (" + what + ")");
+        }
+    }
+
     // ------------------------------------------------------------------ 6. determinism & locks
     {
         Settings s;
@@ -379,7 +425,10 @@ int main()
             a.regenerate (1000 + (juce::uint64) k);
             auto r3 = engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
             CHECK (r3->segments[0].slot == lockedSlot, "locked slice survives regenerate " + juce::String (k)) ;
-            if (r3->segments[1].slot != r1->segments[1].slot) ++changedOthers;
+            int diff = 0;
+            for (size_t i = 1; i < juce::jmin (r1->segments.size(), r3->segments.size()); ++i)
+                diff += r3->segments[i].slot != r1->segments[i].slot ? 1 : 0;
+            if (diff > 0) ++changedOthers;
         }
         CHECK (changedOthers > 5, "unlocked slices change on regenerate");
     }

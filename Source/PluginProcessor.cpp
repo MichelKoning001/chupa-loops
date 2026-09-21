@@ -1952,6 +1952,9 @@ bool SliceTribeProcessor::sceneMatchesCurrent (int i) const
 
 void SliceTribeProcessor::applyParamValues (const ParamMap& values)
 {
+    // undo, a scene or a version puts its own settings on the knobs, so there is nothing
+    // left for the next NEW LOOP to put "back to normal"
+    crazyActive = false;
     for (auto& [id, v] : values)
         if (auto* prm = apvts.getParameter (id))
             if (std::abs (apvts.getRawParameterValue (id)->load() - v) > 1.0e-4f)
@@ -1966,7 +1969,9 @@ void SliceTribeProcessor::applyParamValues (const ParamMap& values)
     Used by CLEAR ALL, so you really start from scratch. */
 void SliceTribeProcessor::resetSettings()
 {
-    for (auto& id : presetParameterIds())
+    auto ids = presetParameterIds();
+    ids.add ("key");   // and KEY back to off (FIT lives on the track slot, which CLEAR ALL empties)
+    for (auto& id : ids)
         if (auto* prm = apvts.getParameter (id))
             if (std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-4f)
             {
@@ -1974,9 +1979,11 @@ void SliceTribeProcessor::resetSettings()
                 prm->setValueNotifyingHost (prm->getDefaultValue());
                 prm->endChangeGesture();
             }
+    presets.loadPreset (0);   // "Init" is exactly the factory position, and the name in the header follows
     crazyActive = false;
     keyRestoreWanted = false;
     keyBeforeReference = -1;
+    pendingReferenceKey = -1;
 }
 
 void SliceTribeProcessor::generateNew (const ParamMap* settingsBefore)
