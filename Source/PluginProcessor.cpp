@@ -198,6 +198,7 @@ SliceTribeProcessor::~SliceTribeProcessor()
     signalThreadShouldExit();
     wake.signal();
     stopThread (10000);
+    cancelPendingUpdate();   // after the worker is gone, so nothing can post another one
 }
 
 //==============================================================================
@@ -951,10 +952,16 @@ void SliceTribeProcessor::run()
                     emb = encodeFlac (*a.original, a.fileRate);
             }
 
+            bool regrid = false;
             {
                 const juce::ScopedLock sl (slotLock);
                 if (slotGeneration[(size_t) i] != job.generation)
                     continue;   // slot was cleared or got a newer file meanwhile – drop this result
+                // anything you changed while the file was loading (FIT, share, tempo, transpose, on/off)
+                // lives in the pending state, not in the copy this job started with
+                const SlotState live = pending[(size_t) i].active ? pending[(size_t) i].state : job.state;
+                regrid = live.reference && a.original != nullptr
+                      && std::abs (live.bpmOverride - job.state.bpmOverride) > 1.0e-6;
                 pending[(size_t) i] = {};
                 a.loadId = nextLoadId++;
                 const bool missing = a.original == nullptr && job.file != juce::File();
@@ -962,8 +969,14 @@ void SliceTribeProcessor::run()
                 slotError[(size_t) i] = missing && job.file.existsAsFile();   // there, but not readable
                 missingFile[(size_t) i] = missing ? job.file : juce::File();
                 slotAudio[(size_t) i] = std::move (a);
-                slotState[(size_t) i] = job.state;
+                slotState[(size_t) i] = live;
                 embeddedAudio[(size_t) i] = std::move (emb);
+                if (regrid)   // a tempo you typed during the load: the fit grid follows it
+                {
+                    auto& na = slotAudio[(size_t) i];
+                    na.gridProfile = engine::gridProfile (*na.original, na.fileRate,
+                                                          live.bpmOverride > 0.0 ? live.bpmOverride : na.detectedBpm);
+                }
             }
             slotsVersion.fetch_add (1);
             updateFitFromSlots();   // a new sample can be (or replace) the reference track
@@ -1435,11 +1448,19 @@ void SliceTribeProcessor::loadSlot (int slot, const juce::File& f)
     if (slotPreviewIndex.load() == slot)
         setSlotPreview (-1);
     SlotState st;
+    bool droppedReference = false;
     {
         // locating a missing file keeps the slot's tempo, transpose and on/off settings
         const juce::ScopedLock sl (slotLock);
         if (slotMissing[(size_t) slot])
             st = slotState[(size_t) slot];
+        else
+            droppedReference = releaseReference (slot);    // another sample: it is not your track any more
+    }
+    if (droppedReference)
+    {
+        restoreKeyAfterReference();
+        updateFitFromSlots();
     }
     queueLoad (slot, f, nullptr, st);
 }
@@ -1536,8 +1557,11 @@ void SliceTribeProcessor::clearSlot (int slot)
 {
     if (slotPreviewIndex.load() == slot)
         setSlotPreview (-1);
+    bool wasReference = false;
     {
         const juce::ScopedLock sl (slotLock);
+        wasReference = slotState[(size_t) slot].reference
+                    || (pending[(size_t) slot].active && pending[(size_t) slot].state.reference);
         slotAudio[(size_t) slot] = {};
         slotState[(size_t) slot] = {};
         pending[(size_t) slot] = {};
@@ -1548,6 +1572,8 @@ void SliceTribeProcessor::clearSlot (int slot)
         slotError[(size_t) slot] = false;
     }
     prepareInterrupt = true;
+    if (wasReference)
+        restoreKeyAfterReference();   // the track is gone, so KEY goes back to what you had
     updateFitFromSlots();
     slotsVersion.fetch_add (1);
     requestUpdate();
@@ -1555,7 +1581,7 @@ void SliceTribeProcessor::clearSlot (int slot)
 
 void SliceTribeProcessor::setSlotEnabled (int slot, bool e)
 {
-    { const juce::ScopedLock sl (slotLock); slotState[(size_t) slot].enabled = e; }
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [e] (SlotState& st) { st.enabled = e; }); }
     slotsVersion.fetch_add (1);
     requestUpdate();
 }
@@ -1564,8 +1590,8 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
 {
     {
         const juce::ScopedLock sl (slotLock);
+        editSlotState (slot, [bpm] (SlotState& s2) { s2.bpmOverride = bpm > 0 ? juce::jlimit (40.0, 300.0, bpm) : 0.0; });
         auto& st = slotState[(size_t) slot];
-        st.bpmOverride = bpm > 0 ? juce::jlimit (40.0, 300.0, bpm) : 0.0;
         if (st.reference && slotAudio[(size_t) slot].original != nullptr)   // the fit grid follows the corrected tempo
         {
             auto& a = slotAudio[(size_t) slot];
@@ -1579,7 +1605,7 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
 
 void SliceTribeProcessor::setSlotTranspose (int slot, int semis)
 {
-    { const juce::ScopedLock sl (slotLock); slotState[(size_t) slot].transpose = juce::jlimit (-12, 12, semis); }
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [semis] (SlotState& st) { st.transpose = juce::jlimit (-12, 12, semis); }); }
     slotsVersion.fetch_add (1);
     requestUpdate();
 }
@@ -1588,7 +1614,7 @@ void SliceTribeProcessor::setSlotWeight (int slot, float w)
 {
     if (! juce::isPositiveAndBelow (slot, kNumSlots))
         return;
-    { const juce::ScopedLock sl (slotLock); slotState[(size_t) slot].weight = juce::jlimit (0.0f, 2.0f, w); }
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [w] (SlotState& st) { st.weight = juce::jlimit (0.0f, 2.0f, w); }); }
     updateFitFromSlots();
     slotsVersion.fetch_add (1);
     requestUpdate();
@@ -1598,6 +1624,8 @@ void SliceTribeProcessor::setSlotWeight (int slot, float w)
 void SliceTribeProcessor::updateFitFromSlots()
 {
     int ref = -1;
+    {
+    const juce::ScopedLock wl (fitWriteLock);   // worker and message thread both call this
     float amount = 0.0f;
     std::array<float, 16> profile {};
     {
@@ -1617,7 +1645,9 @@ void SliceTribeProcessor::updateFitFromSlots()
     for (int i = 0; i < 16; ++i)
         fitProfile[(size_t) i] = ref >= 0 ? profile[(size_t) i] : 0.0f;
     fitVersion.fetch_add (1);
+    }
 
+    // outside the lock: this can end up asking the host for a parameter gesture
     if (const int waiting = pendingReferenceKey.load(); waiting >= 0 && waiting == ref)
         applyReferenceKey (waiting);
 }
@@ -1625,6 +1655,13 @@ void SliceTribeProcessor::updateFitFromSlots()
 /** The loop follows the key of your own track (once it is loaded and its key is known). */
 void SliceTribeProcessor::applyReferenceKey (int slot)
 {
+    // a parameter gesture belongs on the message thread; the worker asks for one instead of doing it
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        pendingReferenceKey = slot;
+        triggerAsyncUpdate();
+        return;
+    }
     int key = -1;
     { const juce::ScopedLock sl (slotLock); key = slotAudio[(size_t) slot].detectedKey; }
     if (key < 0)
@@ -1643,32 +1680,77 @@ void SliceTribeProcessor::applyReferenceKey (int slot)
     }
 }
 
+void SliceTribeProcessor::handleAsyncUpdate()
+{
+    if (keyRestoreWanted.exchange (false))
+        restoreKeyAfterReference();
+    if (const int waiting = pendingReferenceKey.load(); waiting >= 0 && waiting == referenceSlot.load())
+        applyReferenceKey (waiting);
+}
+
+/** FIT off for one slot: the % field goes back to being its share. Call with slotLock held. */
+bool SliceTribeProcessor::releaseReference (int slot)
+{
+    if (! slotState[(size_t) slot].reference)
+        return false;
+    editSlotState (slot, [] (SlotState& st)
+    {
+        st.reference = false;
+        if (st.weightBefore >= 0.0f)
+            st.weight = juce::jlimit (0.0f, 2.0f, st.weightBefore);
+        st.weightBefore = -1.0f;
+    });
+    return true;
+}
+
+/** Puts the KEY back the way it was before a track took it over (message thread). */
+void SliceTribeProcessor::restoreKeyAfterReference()
+{
+    pendingReferenceKey = -1;
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        keyRestoreWanted = true;
+        triggerAsyncUpdate();
+        return;
+    }
+    keyRestoreWanted = false;
+    if (const int back = keyBeforeReference.exchange (-1); back >= 0)
+        if (auto* prm = apvts.getParameter ("key"))
+        {
+            prm->beginChangeGesture();
+            prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, prm->convertTo0to1 ((float) back)));
+            prm->endChangeGesture();
+        }
+}
+
 void SliceTribeProcessor::setSlotReference (int slot, bool isReference)
 {
     if (! juce::isPositiveAndBelow (slot, kNumSlots))
         return;
+    bool wasReference = false;
     {
         const juce::ScopedLock sl (slotLock);
-        for (int i = 0; i < kNumSlots; ++i)
-            if (i != slot)
-                slotState[(size_t) i].reference = false;   // only one track at a time
-        slotState[(size_t) slot].reference = isReference;
-        if (isReference && slotState[(size_t) slot].weight < 0.05f)
-            slotState[(size_t) slot].weight = 1.0f;        // a share of 0% would mean "don't fit at all"
+        if (isReference)
+        {
+            for (int i = 0; i < kNumSlots; ++i)
+                if (i != slot)
+                    releaseReference (i);                  // only one track at a time
+            editSlotState (slot, [] (SlotState& st)
+            {
+                if (! st.reference)
+                    st.weightBefore = st.weight;           // the share comes back when FIT goes off
+                st.reference = true;
+                if (st.weight < 0.05f)
+                    st.weight = 1.0f;                      // a share of 0% would mean "don't fit at all"
+            });
+        }
+        else
+            wasReference = releaseReference (slot);        // a slot that was not the reference stays untouched
     }
     if (isReference)
         applyReferenceKey (slot);
-    else
-    {
-        pendingReferenceKey = -1;
-        if (const int back = keyBeforeReference.exchange (-1); back >= 0)
-            if (auto* prm = apvts.getParameter ("key"))    // put the key back the way you had it
-            {
-                prm->beginChangeGesture();
-                prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, prm->convertTo0to1 ((float) back)));
-                prm->endChangeGesture();
-            }
-    }
+    else if (wasReference)
+        restoreKeyAfterReference();
     updateFitFromSlots();
     slotsVersion.fetch_add (1);
     requestUpdate();
@@ -1709,7 +1791,8 @@ namespace
 {
     bool sameArrangement (const Arrangement& a, const Arrangement& b)
     {
-        return a.seed == b.seed && a.hitSeeds == b.hitSeeds && a.locked == b.locked && a.forceOwn == b.forceOwn;
+        return a.seed == b.seed && a.rhythmSeed == b.rhythmSeed && a.hitSeeds == b.hitSeeds
+            && a.locked == b.locked && a.forceOwn == b.forceOwn && a.charSeeds == b.charSeeds;
     }
     bool sameParams (const SliceTribeProcessor::ParamMap& scene, const SliceTribeProcessor::ParamMap& now)
     {
@@ -1937,7 +2020,7 @@ void SliceTribeProcessor::toggleLock (int h)
     {
         const juce::ScopedLock al (arrangementLock);
         if (juce::isPositiveAndBelow (h, (int) arrangement.locked.size()))
-            arrangement.locked[(size_t) h] ^= 1;
+            arrangement.setLocked ((size_t) h, ! arrangement.locked[(size_t) h]);
         history[(size_t) historyPos].arr = arrangement;
         lockedCount = arrangement.numLocked();
     }
@@ -2141,6 +2224,7 @@ juce::ValueTree SliceTribeProcessor::arrangementToTree (const Arrangement& a, co
     arr.setProperty ("hitSeeds", juce::var (juce::MemoryBlock (a.hitSeeds.data(), a.hitSeeds.size() * sizeof (juce::uint64))), nullptr);
     arr.setProperty ("locked",   juce::var (juce::MemoryBlock (a.locked.data(), a.locked.size())), nullptr);
     arr.setProperty ("forceOwn", juce::var (juce::MemoryBlock (a.forceOwn.data(), a.forceOwn.size())), nullptr);
+    arr.setProperty ("charSeeds", juce::var (juce::MemoryBlock (a.charSeeds.data(), a.charSeeds.size() * sizeof (juce::uint64))), nullptr);
     return arr;
 }
 
@@ -2163,6 +2247,10 @@ void SliceTribeProcessor::arrangementFromTree (const juce::ValueTree& arr, Arran
     };
     readBytes ("locked", a.locked, a.hitSeeds.size());
     readBytes ("forceOwn", a.forceOwn, a.hitSeeds.size());
+    a.charSeeds.assign (a.hitSeeds.size(), 0);   // 0 = "from before this existed": the old sound is kept
+    if (auto* mb = arr.getProperty ("charSeeds").getBinaryData())
+        std::memcpy (a.charSeeds.data(), mb->getData(),
+                     juce::jmin (a.charSeeds.size() * sizeof (juce::uint64), mb->getSize()));
 }
 
 //==============================================================================
@@ -2201,6 +2289,7 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
             t.setProperty ("transpose", st.transpose, nullptr);
             t.setProperty ("weight", st.weight, nullptr);
             t.setProperty ("reference", st.reference, nullptr);
+            t.setProperty ("weightBefore", st.weightBefore, nullptr);
             if (detected > 0.0)
                 t.setProperty ("detectedBpm", detected, nullptr);
             // name and key travel with the project, also to a computer where the path doesn't exist
@@ -2237,6 +2326,8 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
     }
     root.appendChild (sc, nullptr);
     root.setProperty ("editorWidth", editorWidth.load(), nullptr);
+    root.setProperty ("bpm", fallbackBpm.load(), nullptr);   // the tempo you set when no DAW provides one
+    root.setProperty ("keyBeforeFit", keyBeforeReference.load(), nullptr);   // the KEY to go back to when FIT goes off
 
     for (int i = root.getNumChildren(); --i >= 0;)
         if (root.getChild (i).hasType ("PRESET"))
@@ -2261,6 +2352,9 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     stemsRequest = false;
     jobBusy = false;
     crazyActive = false;      // and "back to normal" never carries over into another project
+    pendingReferenceKey = -1; // nor does anything FIT TO TRACK remembered about the previous one
+    keyBeforeReference = -1;  // (the project may put this one back, below)
+    keyRestoreWanted = false;
     juce::MemoryInputStream in (data, (size_t) size, false);
     const auto magic = in.readString();
     if (magic != "CHUPALOOPS1" && magic != "SLICETRIBE1")
@@ -2274,8 +2368,13 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     auto arr = root.getChildWithName ("ARRANGEMENT");
 
     editorWidth = juce::jlimit (0, 4000, (int) root.getProperty ("editorWidth", 0));
+    if (const double savedBpm = root.getProperty ("bpm", 0.0); savedBpm > 20.0)
+        fallbackBpm = juce::jlimit (40.0, 300.0, savedBpm);
+    keyBeforeReference = juce::jlimit (-1, 24, (int) root.getProperty ("keyBeforeFit", -1));
     auto params = root.createCopy();
     params.removeProperty ("editorWidth", nullptr);
+    params.removeProperty ("bpm", nullptr);
+    params.removeProperty ("keyBeforeFit", nullptr);
     params.removeProperty ("midiMap", nullptr);
     for (int i = params.getNumChildren(); --i >= 0;)
         if (params.getChild (i).hasType ("SLOTS") || params.getChild (i).hasType ("ARRANGEMENT") || params.getChild (i).hasType ("PRESET")
@@ -2303,6 +2402,7 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     // Slots: a slot that already holds exactly this audio is kept as it is (host A/B compare, preset
     // recall), others are loaded in the background while the old audio keeps playing until they are ready.
     std::array<bool, kNumSlots> inState {};
+    bool haveReference = false;
     for (auto t : slots)
     {
         const int i = t.getProperty ("index", -1);
@@ -2315,6 +2415,12 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
         st.transpose = t.getProperty ("transpose", 0);
         st.weight = juce::jlimit (0.0f, 2.0f, (float) (double) t.getProperty ("weight", 1.0));
         st.reference = (bool) t.getProperty ("reference", false);
+        st.weightBefore = (float) (double) t.getProperty ("weightBefore", -1.0);
+        if (st.reference && st.weight < 0.05f)
+            st.weight = 1.0f;         // a share of 0% would mean "don't fit at all"
+        if (st.reference && haveReference)
+            st.reference = false;     // only one track at a time, whatever the file says
+        haveReference = haveReference || st.reference;
         const juce::MemoryBlock* emb = t.getProperty ("audio").getBinaryData();
         const auto path = t.getProperty ("path").toString();
         const juce::File file = juce::File::isAbsolutePath (path) ? juce::File (path) : juce::File();
@@ -2380,6 +2486,35 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
         historySizeAtomic = 1;
         keepLocksOnce = true;
         lockedCount = arrangement.numLocked();
+    }
+    // The standalone app reloads whatever was on screen when it was closed, before the window even
+    // exists. Key match is the one setting that must not travel that way: it silently transposes
+    // every sample you drop in next, so a fresh start always begins on Off. A song you load by hand
+    // later on (Options > Load state) and a DAW project both keep the key they were saved with.
+    const bool sessionReload = isStandalone() && ! editorEverOpened.load() && ! standaloneStateRestored.exchange (true);
+    if (sessionReload)
+    {
+        if (auto* prm = apvts.getParameter ("key"))
+            if (prm->getValue() > 0.0f)
+            {
+                prm->beginChangeGesture();
+                prm->setValueNotifyingHost (0.0f);
+                prm->endChangeGesture();
+            }
+        keyBeforeReference = -1;
+    }
+
+    // ... but a slot that is marked as your own track still gets its key, so FIT keeps its promise.
+    // Its audio is usually still loading, so this asks for the key and the worker applies it when ready.
+    if (sessionReload)
+    {
+        const juce::ScopedLock sl (slotLock);
+        for (int i = 0; i < kNumSlots; ++i)
+            if (slotState[(size_t) i].reference || (pending[(size_t) i].active && pending[(size_t) i].state.reference))
+            {
+                pendingReferenceKey = i;
+                break;
+            }
     }
     updateFitFromSlots();
     requestUpdate();
@@ -2709,6 +2844,7 @@ juce::String SliceTribeProcessor::getLastMidiEvent() const
 //==============================================================================
 juce::AudioProcessorEditor* SliceTribeProcessor::createEditor()
 {
+    editorEverOpened = true;
     return new SliceTribeEditor (*this);
 }
 

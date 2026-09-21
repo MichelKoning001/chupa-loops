@@ -128,7 +128,7 @@ MainView::MainView (SliceTribeProcessor& p)
         auto* b = sceneButtons.add (new SceneButton (proc, i));
         const juce::String letter = juce::String::charToString ((juce::juce_wchar) ('A' + i));
         b->setTooltip ("Scene " + letter + ": click an empty scene to store the loop (with its settings and FX), click a stored scene to bring it back.\n"
-                       "Shift-click = store (replaces), right-click = store / clear.\nMIDI note " + juce::MidiMessage::getMidiNoteName (72 + i, true, true, 3)
+                       "Shift-click = store (replaces), right-click = store / recall / clear.\nMIDI note " + juce::MidiMessage::getMidiNoteName (72 + i, true, true, 3)
                        + " recalls it (MIDI NOTES on Control).");
         b->onMessage = [this] (const juce::String& m) { flash (m); };
         addAndMakeVisible (b);
@@ -136,7 +136,8 @@ MainView::MainView (SliceTribeProcessor& p)
 
     keyBox.addItemList (choices::keys(), 1);
     keyBox.setTooltip ("Key match: every sample whose key is known (from Splice-style names like 'Am' or 'Fmin', or heard in the audio) is moved to this key or its relative major/minor (Am fits C). "
-                       "Drum loops are never transposed. 'Off' = no change.");
+                       "Drum loops are never transposed. 'Off' = no change - and Off is where the standalone app starts every time, "
+                       "so nothing is transposed without you asking. A project in your DAW keeps the key you saved with it.");
     keyAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "key", keyBox);
     addAndMakeVisible (keyBox);
 
@@ -310,17 +311,20 @@ void MainView::startTour()
     tour.start ({
         { { 16, 102, 1088, 196 }, "1. Drop your loops",
           "Drop up to 8 loops here - basslines, synths, vocals, drums, any tempo and any key. Tempo and key are read from the file name, or from the audio itself. "
-          "Right-click a sample for its menu: listen to it on its own, or use it as YOUR TRACK so the new loop fits around it." },
-        { { 924, 520, 180, 60 }, "2. New loop",
+          "The triangle listens to one sample on its own, the % says how often slices are taken from it." },
+        { { 16, 102, 263, 92 }, "2. FIT TO TRACK",
+          "Drop a part of YOUR OWN song into a slot and press FIT on it. That sample is never sliced: it is the track the new loop has to fit around. "
+          "Chupa Loops hears where your track is busy and leaves room there, and the key follows it. The % next to FIT says how hard it gets out of the way." },
+        { { 924, 520, 180, 60 }, "3. New loop",
           "Every click builds a brand new loop from slices out of all your loops. Not a chopped-up copy: a new groove." },
-        { { 16, 310, 1088, 198 }, "3. Shape it",
+        { { 16, 310, 1088, 198 }, "4. Shape it",
           "Click a slice to swap it for another, right-click to lock it. AUTO PICK makes eight loops and keeps the best, KEEP parks a loop in a scene. "
           "In the panel on the right: MUTATE for a variation, RHY for another rhythm, SRC for other sounds." },
-        { { 16, 520, 540, 264 }, "4. Rhythm and length",
+        { { 16, 520, 540, 264 }, "5. Rhythm and length",
           "Pick the rhythm the slices are placed on, the length (1 to 32 bars), a FILL at the end of every phrase, and TIME FEEL for half or double speed." },
-        { { 384, 66, 354, 32 }, "5. Scenes",
+        { { 384, 66, 354, 32 }, "6. Scenes",
           "Store your favourite loops in scenes A to H and switch between them while you play (MIDI C4 to G4)." },
-        { { 924, 716, 180, 62 }, "6. Into your song",
+        { { 924, 716, 180, 62 }, "7. Into your song",
           "Drag the loop out as WAV, or as MIDI: with MIDI NOTES set to Slices every note plays one slice (C1 = the whole loop). The FX tab gives it the finishing touch." },
     });
 }
@@ -413,7 +417,7 @@ void MainView::paint (juce::Graphics& g)
     }
 
     // samples toolbar (drawn straight on the background)
-    const juce::String hint ("Drop up to 8 loops - any tempo, any key.");
+    const juce::String hint ("Drop up to 8 loops - your own track too (FIT).");
     if (s.sticker)
     {
         // candy skins: a title chip and dark pills, so the text stays readable on the loud background
@@ -870,6 +874,7 @@ void MainView::updateState()
 
     const bool hasLoop = proc.hasLoop();
     const int sliceable = loadedCount - (proc.getReferenceSlot() >= 0 ? 1 : 0);   // your own track is not sliced
+    resultView.setOnlyReferenceLoaded (sliceable <= 0 && proc.getReferenceSlot() >= 0);
     generateButton.setEnabled (sliceable > 0);
     crazyButton.setEnabled (sliceable > 0);
     mutateButton.setEnabled (hasLoop);

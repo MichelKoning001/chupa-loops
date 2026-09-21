@@ -19,7 +19,7 @@ Feed it up to 8 loops (basslines, for example). Chupa Loops cuts them into slice
 - **7 skins:** Lolly, Fruity, Skull, Butcher, Neon, Acid and Smile, each with a lolly mascot that reacts when you make a new loop (Lolly and Fruity share the swirl lolly in their own colours).
 - **The craziest loop ever:** every skin has its own wild button (Sugar Rush, Fruit Punch, Skull Damage, The Butcher Cut, Neon Overdrive, Acid Flashback, Smiley Mayhem) that throws the rhythm, slicing and character around and makes a new loop.
 - **FX rack** (finishing layer on the whole loop): low-pass with per-slice envelope, resonance, low cut, drive, sidechain pump and stereo width.
-- **FIT TO TRACK:** right-click a sample and mark it as *my track*. That slot is not sliced: the new loop leaves room where your track is busy (a 1/16 grid profile of its energy) and the key follows it.
+- **FIT TO TRACK:** press **FIT** on a slot to mark it as *my track*. That slot is not sliced: the new loop leaves room where your track is busy (a 1/16 grid profile of its energy) and the key follows it. Every bar keeps the hits that sit on the quietest spots of your track - a quarter of the bar at 100%, fewer as you turn FIT up, always at least one - so fitting can never empty the loop.
 - **Share per sample:** how often slices come from each slot (0-200%), and a play button to hear a sample on its own.
 - **Energy:** the loop gets busier and more glitchy towards the end.
 - **Time feel:** half time or double time on the sample material, with the beat grid unchanged.
@@ -28,11 +28,11 @@ Feed it up to 8 loops (basslines, for example). Chupa Loops cuts them into slice
 - **MUTATE** (a variation: a quarter of the unlocked slices change) and **scenes A–H** to store and recall favorite loops live.
 - **Play it as an instrument** (MIDI NOTES): **Slices** = C1 plays the whole loop, C#1 and up every different slice; **Keys** = the loop follows the key you play (C3 = original pitch).
 - **MIDI control** (MIDI NOTES = Control; note names with middle C = C3): C1 = new loop, C#1/D1 = previous/next version, D#1 = unlock all, E1 = the skin's crazy button, F1 = mutate, C2–G#2 = rhythm, C3–F3 = length, C4–G4 = scenes A–H, program change = preset (0 = Init, 1–100 = factory presets). Right-click any knob or selector to **MIDI learn** a CC. The **New Loop** parameter can be automated.
-- **Fix one slice at a time.** Click a slice to replace just that slice. Right-click to lock it. Use ◀ ▶ to go back to earlier versions (with their settings).
+- **Fix one slice at a time.** Click a slice to replace just that slice. Right-click to lock it: locking freezes exactly the sound it has at that moment, through NEW LOOP, RHY, SRC and MUTATE. Use ◀ ▶ to go back to earlier versions (with their settings).
 - **Plays in sync** with your DAW. **PREVIEW** lets you listen without the transport.
 - **Into your project:** drag the loop out as **WAV** or as **MIDI** (one note per slice), or export a WAV, a MIDI file, a **slice kit** (every slice as a WAV + the MIDI) or **stems** (one WAV per sample).
 - **Saved with your project,** including the samples themselves (embedded FLAC, up to 64 seconds per slot).
-- **Standalone app** included, and a short first-run tour.
+- **Standalone app** included, and a short first-run tour. Without a host it starts at 125 BPM and the tempo you set is saved with the session; key match always reopens on Off (unless a slot is marked MY TRACK), so nothing is transposed without you asking.
 - **Checked** in every build with Apple's `auval`, Tracktion's `pluginval` and the engine tests (logged, non-blocking). The audio, preset and MIDI tests in `tests/` run locally.
 
 ![Skins](docs/skins.png)

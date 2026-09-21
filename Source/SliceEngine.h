@@ -11,6 +11,7 @@ namespace slicetribe
 
 constexpr int kNumSlots = 8;
 constexpr double maxSampleSeconds = 128.0;   // longer files are truncated (32 bars at 60 bpm)
+constexpr double defaultBpm = 125.0;         // tempo we start on when no host tells us otherwise
 
 //==============================================================================
 // Choices shown in the UI. The order here is the order of the parameter values.
@@ -104,12 +105,16 @@ struct Arrangement
     std::vector<juce::uint64> hitSeeds;
     std::vector<juce::uint8>  locked;
     std::vector<juce::uint8>  forceOwn;   // a re-rolled hit inside a repeated motif
+    std::vector<juce::uint64> charSeeds;  // locked hits: the rhythm seed they were locked on, so they keep that sound
 
     void resizeFor (size_t numHits);
     void regenerate (juce::uint64 newSeed);      // keeps locked hits
     void regenerateRhythm (juce::uint64 newSeed);// only the rhythm seed: the sources stay
     void regenerateSources (juce::uint64 salt);  // only the sources: the rhythm stays
     void reroll (size_t hitIndex, juce::uint64 salt);
+    /** Locks or unlocks a hit; locking freezes the sound it has right now. */
+    void setLocked (size_t hitIndex, bool isLocked);
+    juce::uint64 characterSeedFor (size_t hitIndex) const;
     int  numLocked() const;
 };
 
@@ -154,6 +159,7 @@ struct SlotState
     int    transpose = 0;       // manual, -12..12
     float  weight = 1.0f;       // 0..2: how often slices are taken from this sample (1 = normal share)
     bool   reference = false;   // "my track": not sliced, the new loop fits around it
+    float  weightBefore = -1.0f;// the share this slot had before FIT took the field over (-1 = none)
 };
 
 //==============================================================================
@@ -169,7 +175,7 @@ struct RenderResult
 {
     juce::AudioBuffer<float> audio;
     std::vector<Segment> segments;
-    double bpm = 120.0, rate = 44100.0;
+    double bpm = defaultBpm, rate = 44100.0;
     int bars = 4;
     Settings settings;   // what this loop was rendered with
     int key = -1;        // key-match target it was rendered with (-1 = off)

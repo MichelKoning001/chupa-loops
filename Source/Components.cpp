@@ -613,6 +613,15 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     weightField.setTooltip ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%.");
     addAndMakeVisible (weightField);
 
+    fitButton.setButtonText ("FIT");
+    fitButton.setClickingTogglesState (false);
+    fitButton.setTooltip ("FIT TO TRACK: this is a part of YOUR OWN track.\n"
+                          "It is never sliced - the new loop leaves room where your track is busy, and KEY follows this sample.\n"
+                          "The % next to it says how hard the new loop stays out of the way.\n"
+                          "Click again to turn it off: the % is a normal share again and KEY goes back to what you had.");
+    fitButton.onClick = [this] { proc.setSlotReference (index, ! info.reference); };
+    addAndMakeVisible (fitButton);
+
     playButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb6"));
     playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping).\nClick again to stop.");
     playButton.onClick = [this] { proc.setSlotPreview (index); };
@@ -623,7 +632,7 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     clearButton.onClick = [this] { proc.clearSlot (index); };
     addAndMakeVisible (clearButton);
 
-    setTooltip ("Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.");
+    setTooltip ("Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\nA part of your own song goes here too - press FIT on the slot afterwards.");
 }
 
 void SlotComponent::refresh (const SlotInfo& i)
@@ -634,13 +643,15 @@ void SlotComponent::refresh (const SlotInfo& i)
     transposeField.setVisible (show);
     powerButton.setVisible (show);
     playButton.setVisible (show);
+    fitButton.setVisible (show);
+    fitButton.setToggleState (info.reference, juce::dontSendNotification);
     weightField.setVisible (show);
     weightField.setValue (juce::roundToInt (info.weight * 100.0f));
     weightField.highlighted = info.reference || std::abs (info.weight - 1.0f) > 0.01f;
     weightField.setTooltip (info.reference
-        ? juce::String ("FIT: how hard the new loop stays out of your track's way. 0% = not at all, 200% = really out of the way.")
+        ? juce::String ("FIT: how hard the new loop stays out of your track's way.\n0% = not at all, 100% = normal, 200% = really out of the way.\nDrag up/down, double-click = 100%.")
         : juce::String ("Share: how often slices are taken from this sample.\n100% = normal, 0% = never, 200% = twice as often.\nDrag up/down, double-click = 100%."));
-    weightField.colour = colours::slot (index);
+    weightField.colour = info.reference ? colours::cyan() : colours::slot (index);   // it is the FIT amount now
     clearButton.setVisible (show || info.missing || info.error);
     powerButton.setToggleState (info.enabled, juce::dontSendNotification);
     powerButton.setButtonText (info.enabled ? "ON" : "OFF");
@@ -651,7 +662,7 @@ void SlotComponent::refresh (const SlotInfo& i)
     transposeField.highlighted = info.transpose != 0;
     transposeField.colour = colours::slot (index);
 
-    juce::String tip = "Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.";
+    juce::String tip = "Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\nA part of your own song goes here too - press FIT on the slot afterwards.";
     if (info.loaded)
     {
         const double src = info.bpmOverride > 0 ? info.bpmOverride : info.detectedBpm;
@@ -664,8 +675,8 @@ void SlotComponent::refresh (const SlotInfo& i)
     else if (info.error)
         tip = "This file can't be read. Use WAV, AIFF, FLAC, MP3 or OGG.";
     if (info.reference)
-        tip = info.name + "\nYour own track: it is not sliced. The new loop leaves room where this track is busy,\n"
-                          "and the key follows this sample. Right-click to turn it off.";
+        tip = info.name + "\nMY TRACK: this sample is never sliced. The new loop leaves room where your track is busy,\n"
+                          "and the key follows it. Press FIT again to turn it off.";
     setTooltip (tip);
     repaint();
 }
@@ -692,7 +703,8 @@ void SlotComponent::resized()
     bottom.removeFromRight (6);
     bpmField.setBounds (bottom.removeFromRight (74));
     clearButton.setBounds (getWidth() - 30, 8, 20, 20);
-    weightField.setBounds (getWidth() - 84, 8, 48, 20);
+    weightField.setBounds (getWidth() - 82, 8, 46, 20);
+    fitButton.setBounds   (getWidth() - 118, 8, 32, 20);
 }
 
 void SlotComponent::paint (juce::Graphics& g)
@@ -742,7 +754,7 @@ void SlotComponent::paint (juce::Graphics& g)
     }
 
     // title row: name ... [key] [+x%]
-    auto tags = title.withTrimmedRight (80.0f);   // room for the share field and the clear button
+    auto tags = title.withTrimmedRight (112.0f);   // room for the FIT button, the share field and the clear button
     auto drawTag = [&] (const juce::String& t, juce::Colour c)
     {
         const float w = juce::GlyphArrangement::getStringWidth (uiFont (10.5f, 1), t) + 10.0f;
@@ -754,8 +766,6 @@ void SlotComponent::paint (juce::Graphics& g)
         g.setFont (uiFont (10.5f, 1));
         g.drawText (t, tr, juce::Justification::centred);
     };
-    if (info.reference)
-        drawTag ("MY TRACK", colours::cyan());
     const double stretchPct = (info.stretchRatio - 1.0) * 100.0;
     if (std::abs (stretchPct) >= 0.5)
         drawTag ((stretchPct > 0 ? "+" : "") + juce::String (juce::roundToInt (stretchPct)) + "%", colours::dim());
@@ -789,6 +799,20 @@ void SlotComponent::paint (juce::Graphics& g)
         }
     }
 
+    // "my track" is the one thing you must be able to see at a glance, so it gets a badge of its own
+    if (info.reference && wave.getHeight() > 10)
+    {
+        const auto f = uiFont (10.5f, 2);
+        const juce::String t ("MY TRACK");
+        auto pill = wave.withSizeKeepingCentre (juce::GlyphArrangement::getStringWidth (f, t) + 14.0f, 17.0f)
+                        .withX (wave.getX());
+        g.setColour (colours::panel2().withAlpha (0.92f));
+        g.fillRoundedRectangle (pill, 4.0f);
+        g.setColour (colours::cyan());
+        g.drawRoundedRectangle (pill.reduced (0.5f), 4.0f, 1.0f);
+        g.setFont (f);
+        g.drawText (t, pill, juce::Justification::centred);
+    }
 }
 
 void SlotComponent::paintOverChildren (juce::Graphics& g)
@@ -1042,12 +1066,24 @@ void ResultView::paint (juce::Graphics& g)
         auto t = area.withTrimmedLeft (m.getRight() - area.getX() + 24.0f);
         g.setColour (colours::screenText());
         g.setFont (uiFont (17.0f, 1));
-        g.drawText ("Feed me loops!", t.withTrimmedBottom (40), juce::Justification::centredLeft);
+        g.drawText (onlyReference ? "That one is your track!" : "Feed me loops!",
+                    t.withTrimmedBottom (40), juce::Justification::centredLeft);
         g.setColour (colours::screenText().withAlpha (0.72f));
         g.setFont (uiFont (12.5f));
+        if (onlyReference)
+        {
+            g.drawText ("A sample marked with FIT is never sliced - it is what the new loop has to fit around.",
+                        t.withTrimmedTop (4), juce::Justification::centredLeft);
+            g.drawText ("Drop a loop or two in the other slots to build from, or press FIT again to turn it off.",
+                        t.withTrimmedTop (44), juce::Justification::centredLeft);
+            return;
+        }
         g.drawText ("Drop up to 8 loops on the slots above - from Finder/Explorer, Splice or your DAW's browser.",
                     t.withTrimmedTop (4), juce::Justification::centredLeft);
         g.drawText ("Then hit NEW LOOP until you love it.", t.withTrimmedTop (44), juce::Justification::centredLeft);
+        g.setColour (colours::cyan());
+        g.drawText ("Drop a part of your own track in too and press FIT on that slot - the loop then fits around it.",
+                    t.withTrimmedTop (84), juce::Justification::centredLeft);
         return;
     }
 

@@ -71,6 +71,7 @@ void Arrangement::resizeFor (size_t numHits)
     hitSeeds.resize (numHits);
     locked.resize (numHits, 0);
     forceOwn.resize (numHits, 0);
+    charSeeds.resize (numHits, 0);
 
     for (size_t i = old; i < numHits; ++i)
         hitSeeds[i] = hashCombine (seed, (juce::uint64) i);
@@ -103,6 +104,26 @@ void Arrangement::regenerateSources (juce::uint64 salt)
     for (size_t i = 0; i < hitSeeds.size(); ++i)
         if (! locked[i])
             hitSeeds[i] = hashCombine (hitSeeds[i], salt);
+}
+
+/** The stream a hit's reverses, octaves and rolls come from. A locked hit keeps the one it was
+    locked on, so locking freezes exactly what you were hearing and nothing changes afterwards. */
+juce::uint64 Arrangement::characterSeedFor (size_t i) const
+{
+    if (i < locked.size() && locked[i] && i < charSeeds.size() && charSeeds[i] != 0)
+        return charSeeds[i];
+    if (i < locked.size() && locked[i])
+        return hashCombine (i < hitSeeds.size() ? hitSeeds[i] : hashCombine (seed, (juce::uint64) i), 0x51CEull);   // older projects
+    return rhythmSeed;
+}
+
+void Arrangement::setLocked (size_t i, bool isLocked)
+{
+    if (i >= locked.size())
+        return;
+    if (isLocked && charSeeds.size() > i)
+        charSeeds[i] = rhythmSeed != 0 ? rhythmSeed : 1;   // freeze the sound it has at this moment
+    locked[i] = isLocked ? 1 : 0;
 }
 
 void Arrangement::reroll (size_t i, juce::uint64 salt)
@@ -1178,7 +1199,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
 
     std::vector<size_t> barFirst ((size_t) s.bars + 1, hits.size());
     for (size_t h = hits.size(); h-- > 0;)
-        barFirst[(size_t) hits[h].bar] = h;
+        if (juce::isPositiveAndBelow (hits[h].bar, (int) barFirst.size()))
+            barFirst[(size_t) hits[h].bar] = h;
 
     auto bufferOf = [&] (int slot, bool octave) -> const juce::AudioBuffer<float>&
     {
@@ -1194,6 +1216,55 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
     // ---------------------------------------------------------------- 1. decide every hit
     std::vector<Choice> choicesOut;
     choicesOut.reserve (hits.size());
+
+    // a fill is played whatever your own track is doing
+    auto inFill = [&s] (const Hit& hit)
+    {
+        if (s.fillBars <= 0)
+            return false;
+        const double span = 16.0 * juce::jmin (s.fillBars, s.bars);
+        return std::fmod (hit.startStep, span) >= span - juce::jmin (8.0, span * 0.5) - 1.0e-6;
+    };
+
+    // FIT TO TRACK skips hits that land on a busy spot in your own track. If your track and the
+    // rhythm you picked happen to agree, that would skip everything and leave you with silence, so
+    // every bar keeps a few hits: the ones on the quietest spots in your track, a quarter of the
+    // bar at FIT 100% and less as FIT goes up. The choice is made before anything is decided per
+    // hit and ignores locks, so locking a slice never moves another one.
+    std::vector<char> fitProtected (hits.size(), (char) 0);
+    if (s.fit > 0.001f && ! hits.empty())
+    {
+        int maxBar = 0;
+        for (const auto& hit : hits) maxBar = juce::jmax (maxBar, hit.bar);
+        std::vector<std::vector<size_t>> perBar ((size_t) maxBar + 1);
+        for (size_t i = 0; i < hits.size(); ++i)
+            if (hits[i].bar >= 0 && ! inFill (hits[i]))
+                perBar[(size_t) hits[i].bar].push_back (i);
+
+        auto stepOf = [&hits] (size_t i) { return juce::jlimit (0, 15, ((int) std::llround (hits[i].startStep)) % 16); };
+        auto busyAt = [&s, &stepOf] (size_t i) { return s.fitProfile[(size_t) stepOf (i)]; };
+        // when your track is equally busy everywhere, keep the strong beats: 1 first, then 3, then 2 and 4
+        auto beatStrength = [&stepOf] (size_t i)
+        {
+            const int st = stepOf (i);
+            return st % 16 == 0 ? 4 : st % 8 == 0 ? 3 : st % 4 == 0 ? 2 : st % 2 == 0 ? 1 : 0;
+        };
+        const double share = juce::jlimit (0.05, 1.0, 0.25 / juce::jmax (1.0, (double) s.fit));
+        for (auto& bar : perBar)
+        {
+            if (bar.empty())
+                continue;
+            std::stable_sort (bar.begin(), bar.end(), [&] (size_t a, size_t b)
+            {
+                if (busyAt (a) != busyAt (b))             return busyAt (a) < busyAt (b);
+                if (beatStrength (a) != beatStrength (b)) return beatStrength (a) > beatStrength (b);
+                return a < b;
+            });
+            const int keep = juce::jlimit (1, (int) bar.size(), (int) std::ceil ((double) bar.size() * share));
+            for (int k = 0; k < keep; ++k)
+                fitProtected[bar[(size_t) k]] = (char) 1;
+        }
+    }
 
     for (size_t h = 0; h < hits.size(); ++h)
     {
@@ -1222,7 +1293,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
         const double uPos   = uniform (st);
         // The "character" of a hit (reverse, octave, rolls) comes from its own stream, so a new rhythm
         // keeps the sources. A locked hit uses its own seed for that too, so it never changes at all.
-        const juce::uint64 characterSeed = isLocked ? hashCombine (own, 0x51CEull) : arr.rhythmSeed;
+        const juce::uint64 characterSeed = arr.characterSeedFor (h);
         juce::uint64 rt = hashCombine (seedToUse, characterSeed ^ 0x9E3779B97F4A7C15ull);
         const double uRev   = uniform (rt);
         const double uOct   = uniform (rt);
@@ -1367,10 +1438,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kNu
             }
         }
         // FIT TO TRACK: skip hits that land where your own track is already busy
-        const bool inFillZone = s.fillBars > 0
-            && std::fmod (hit.startStep, 16.0 * juce::jmin (s.fillBars, s.bars))
-                 >= 16.0 * juce::jmin (s.fillBars, s.bars) - juce::jmin (8.0, 16.0 * juce::jmin (s.fillBars, s.bars) * 0.5) - 1.0e-6;
-        if (s.fit > 0.001f && ! isLocked && ! inFillZone)   // a fill always stays
+        if (s.fit > 0.001f && ! isLocked && ! fitProtected[h] && ! inFill (hit))   // a fill always stays
         {
             const int step = ((int) std::llround (hit.startStep)) % 16;
             const float busy = s.fitProfile[(size_t) juce::jlimit (0, 15, step)];

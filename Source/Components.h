@@ -199,7 +199,7 @@ private:
     bool dragOver = false, previewing = false;
 
     DragNumber bpmField, transposeField, weightField;
-    juce::TextButton powerButton, clearButton, playButton;
+    juce::TextButton powerButton, clearButton, playButton, fitButton;
     std::unique_ptr<juce::FileChooser> chooser;
 };
 
@@ -214,6 +214,8 @@ public:
     void setPlayhead (double pos);
     void setBusy (bool);
     void showMessage (const juce::String&, juce::Colour, int ticks);
+    /** Everything that is loaded is your own track: the empty screen says so instead of "feed me". */
+    void setOnlyReferenceLoaded (bool b) { if (b != onlyReference) { onlyReference = b; repaint(); } }
     void startChopFlash() { flashTicks = flashLength; repaint(); }
     void tick();
 
@@ -241,6 +243,7 @@ private:
     int messageTicks = 0;
     static constexpr int flashLength = 12;
     int flashTicks = 0;
+    bool onlyReference = false;
 };
 
 //==============================================================================

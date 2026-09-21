@@ -29,6 +29,7 @@ struct SlotInfo
 class SliceTribeProcessor : public juce::AudioProcessor,
                             private juce::Thread,
                             private juce::Timer,
+                            private juce::AsyncUpdater,
                             private juce::AudioProcessorValueTreeState::Listener
 {
 public:
@@ -246,6 +247,7 @@ private:
     std::atomic<float> fitAmount { 0.0f };
     std::array<std::atomic<float>, 16> fitProfile {};
     std::atomic<int> fitVersion { 0 };     // seqlock: odd while being written
+    juce::CriticalSection fitWriteLock;    // one writer at a time, so the seqlock stays honest
     std::atomic<int> pendingReferenceKey { -1 };   // slot whose key still has to be applied after loading
     std::atomic<int> keyBeforeReference { -1 };
     void updateFitFromSlots();
@@ -260,7 +262,21 @@ private:
     std::atomic<bool> crazyActive { false };
     void runAutoPick (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate, int candidates);
     void runStems (const std::array<bool, kNumSlots>& enabled, const Settings& rs, double bpm, double rate);
-    std::atomic<double> hostBpm { 140.0 }, fallbackBpm { 140.0 }, currentRate { 0.0 }, playPosition { -1.0 };
+    std::atomic<double> hostBpm { defaultBpm }, fallbackBpm { defaultBpm }, currentRate { 0.0 }, playPosition { -1.0 };
+    std::atomic<bool> standaloneStateRestored { false };   // the standalone reloads its last session once
+    std::atomic<bool> editorEverOpened { false };          // ... and it does that before the window exists
+    std::atomic<bool> keyRestoreWanted { false };
+    void handleAsyncUpdate() override;
+    bool releaseReference (int slot);        // call with slotLock held
+    void restoreKeyAfterReference();
+    /** Changes a slot's settings, also on a file that is still loading. Call with slotLock held. */
+    template <typename Fn>
+    void editSlotState (int slot, Fn&& fn)
+    {
+        fn (slotState[(size_t) slot]);
+        if (pending[(size_t) slot].active)
+            fn (pending[(size_t) slot].state);
+    }
 
     // result hand-off
     mutable juce::SpinLock resultLock;
