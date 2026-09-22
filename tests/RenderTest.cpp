@@ -237,6 +237,29 @@ int main()
             for (auto& h : hits) cutAt56 |= std::abs (h.startStep - 56.0) < 1.0e-6;
             CHECK (cutAt56, "fill with 1-bar slices: a slice starts at the fill (step 56)");
         }
+
+        // slice size works on every rhythm: four-to-the-floor with 1/32 slices gives 32 per bar
+        {
+            auto perBar = [] (int pattern, double sliceSteps)
+            {
+                Settings ss;
+                ss.bars = 1; ss.pattern = pattern; ss.sliceSteps = sliceSteps; ss.motifBars = 0; ss.fillBars = 0;
+                auto hits = engine::buildHits (ss, 7);
+                double longest = 0.0;
+                for (auto& h : hits) longest = std::max (longest, h.lenSteps);
+                return std::pair<int, double> { (int) hits.size(), longest };
+            };
+            const auto floor32 = perBar (patFourFloor, 0.5);
+            const auto floor16 = perBar (patFourFloor, 1.0);
+            const auto floor8  = perBar (patFourFloor, 2.0);
+            const auto roll32  = perBar (patRolling, 0.5);
+            std::cout << "     4-to-the-floor: 1/32 -> " << floor32.first << " slices, 1/16 -> "
+                      << floor16.first << ", 1/8 -> " << floor8.first << "\n";
+            CHECK (floor32.first == 32 && floor32.second <= 0.5 + 1.0e-9, "1/4 rhythm with 1/32 slices: 32 slices in a bar");
+            CHECK (floor16.first == 16 && floor8.first == 8, "and 1/16 gives 16, 1/8 gives 8");
+            CHECK (roll32.first == 32, "a 1/16 rhythm with 1/32 slices gives 32 too");
+            CHECK (perBar (patRolling, 4.0).first == 16, "a note shorter than the slice size keeps its own length");
+        }
     }
 
     // ------------------------------------------------------------------ 4. test basslines
@@ -431,6 +454,355 @@ int main()
             if (diff > 0) ++changedOthers;
         }
         CHECK (changedOthers > 5, "unlocked slices change on regenerate");
+    }
+
+    // ------------------------------------------------------------------ 6b. every character knob does something
+    {
+        auto renderWith = [&] (int pattern, double sliceSteps, std::function<void (Settings&)> tweak)
+        {
+            Settings s;
+            s.bars = 2; s.pattern = pattern; s.sliceSteps = sliceSteps;
+            s.motifBars = 1; s.variation = 0.0f; s.chaos = 0.0f;
+            tweak (s);
+            Arrangement a; a.seed = 4242;
+            auto hits = engine::buildHits (s, a.seed);
+            a.resizeFor (hits.size());
+            a.regenerate (4242);
+            return engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+        };
+        auto sig = [] (const RenderResult& r)
+        {
+            juce::String o;
+            for (const auto& sg : r.segments)
+                o << sg.start << ":" << sg.length << ":" << sg.slot << ":" << sg.srcStart
+                  << ":" << (int) sg.reversed << (int) sg.octave << (int) sg.glitch << " ";
+            return o;
+        };
+        auto starts = [] (const RenderResult& r)
+        {
+            juce::String o;
+            for (const auto& sg : r.segments) o << sg.start << " ";
+            return o;
+        };
+
+        enum Shows { inTheSlices, inThePositions, inTheSoundOnly };
+        struct Knob { const char* name; std::function<void (Settings&)> on; Shows shows; };
+        const std::vector<Knob> knobs {
+            { "CHAOS",     [] (Settings& s) { s.chaos = 1.0f; },                         inTheSlices },
+            { "VARIATION", [] (Settings& s) { s.variation = 1.0f; },                     inTheSlices },
+            { "GATE",      [] (Settings& s) { s.gate = 0.3f; },                          inTheSlices },
+            { "SWING",     [] (Settings& s) { s.swing = 0.6f; },                         inThePositions },
+            { "AMOUNT",    [] (Settings& s) { s.style = styleGlitch; s.amount = 1.0f; }, inTheSlices },
+            { "REVERSE",   [] (Settings& s) { s.reverse = 1.0f; },                       inTheSlices },
+            { "OCTAVE",    [] (Settings& s) { s.octave = 1.0f; },                        inTheSlices },
+            { "FADE",      [] (Settings& s) { s.fadeMs = 25.0f; },                       inTheSoundOnly },
+            { "ENERGY",    [] (Settings& s) { s.energy = 1.0f; },                        inTheSlices },
+        };
+        // on every rhythm and every slice size, not only on the one they happen to work on
+        const std::vector<std::pair<int, double>> setups {
+            { patFree, 2.0 },        // the settings it starts on: Free, 1/8
+            { patFourFloor, 4.0 },   // 4 to the floor, 1/4 slices
+            { patRolling, 1.0 },     // rolling 1/16
+        };
+        for (const auto& setup : setups)
+        {
+            const juce::String where = choices::patterns[setup.first] + " @ "
+                                     + juce::String (16.0 / setup.second, 0) + " slices/bar";
+            auto plain = renderWith (setup.first, setup.second, [] (Settings&) {});
+            const auto plainSig = sig (*plain), plainStarts = starts (*plain);
+            double plainRms = 0.0;
+            for (int i = 0; i < plain->audio.getNumSamples(); ++i)
+                plainRms += (double) plain->audio.getSample (0, i) * plain->audio.getSample (0, i);
+            plainRms = std::sqrt (plainRms / juce::jmax (1, plain->audio.getNumSamples()));
+            CHECK (plainRms > 0.001, juce::String ("the loop sounds at all (") + where + ")");
+
+            for (const auto& k : knobs)
+            {
+                auto changed = renderWith (setup.first, setup.second, k.on);
+                const bool moved = k.shows == inTheSoundOnly ? true
+                                 : k.shows == inThePositions ? starts (*changed) != plainStarts
+                                                             : sig (*changed) != plainSig;
+                bool audible = false;
+                if (changed->audio.getNumSamples() == plain->audio.getNumSamples())
+                    for (int i = 0; i < changed->audio.getNumSamples() && ! audible; i += 7)
+                        audible = std::abs (changed->audio.getSample (0, i) - plain->audio.getSample (0, i)) > 1.0e-4f;
+                else
+                    audible = true;
+                CHECK (moved && audible, juce::String (k.name) + " changes the loop (" + where + ")");
+            }
+        }
+
+        // and the lists next to them: rhythm, length, repeat, slice mode, slice size, style,
+        // stretch, fill, time feel and FIT. Every one of them has to change the loop.
+        {
+            auto base = renderWith (patFree, 2.0, [] (Settings&) {});
+            const auto baseSig = sig (*base);
+            struct Sel { const char* name; std::function<void (Settings&)> on; };
+            const std::vector<Sel> sels {
+                { "RHYTHM 4 to the floor", [] (Settings& s2) { s2.pattern = patFourFloor; } },
+                { "RHYTHM Offbeat",        [] (Settings& s2) { s2.pattern = patOffbeat; } },
+                { "RHYTHM Rolling",        [] (Settings& s2) { s2.pattern = patRolling; } },
+                { "RHYTHM Broken",         [] (Settings& s2) { s2.pattern = patBroken; } },
+                { "RHYTHM Random",         [] (Settings& s2) { s2.pattern = patRandom; } },
+                { "LENGTH 8 bars",         [] (Settings& s2) { s2.bars = 8; } },
+                { "REPEAT off",            [] (Settings& s2) { s2.motifBars = 0; } },
+                { "REPEAT 2 bars",         [] (Settings& s2) { s2.motifBars = 2; s2.bars = 4; } },
+                { "SLICE MODE transient",  [] (Settings& s2) { s2.sliceMode = 1; } },
+                { "SLICE SIZE 1/32",       [] (Settings& s2) { s2.sliceSteps = 0.5; } },
+                { "SLICE SIZE 1/4",        [] (Settings& s2) { s2.sliceSteps = 4.0; } },
+                { "STYLE Glitch",          [] (Settings& s2) { s2.style = styleGlitch; } },
+                { "STYLE Lo-Fi",           [] (Settings& s2) { s2.style = styleLoFi; } },
+                { "FILL every 4 bars",     [] (Settings& s2) { s2.fillBars = 4; } },
+                { "FIT 100%",              [] (Settings& s2) { s2.fit = 1.0f; for (auto& v : s2.fitProfile) v = 0.0f;
+                                                              s2.fitProfile[0] = 1.0f; s2.fitProfile[4] = 1.0f;
+                                                              s2.fitProfile[8] = 1.0f; s2.fitProfile[12] = 1.0f; } },
+            };
+            for (const auto& sel : sels)
+            {
+                auto changed = renderWith (patFree, 2.0, sel.on);
+                bool audible = changed->audio.getNumSamples() != base->audio.getNumSamples();
+                for (int i = 0; i < changed->audio.getNumSamples() && ! audible; i += 7)
+                    audible = std::abs (changed->audio.getSample (0, i) - base->audio.getSample (0, i)) > 1.0e-4f;
+                juce::ignoreUnused (baseSig);
+                CHECK (audible, juce::String (sel.name) + " changes the loop");
+            }
+            // the rhythm has to stay audible however fine you slice: at 1/32 a 1/4 rhythm is
+            // four chopped quarter notes, not the same 32 loose slices as Free or Rolling
+            {
+                auto fine = [&] (int pat) { return renderWith (pat, 0.5, [] (Settings& s2) { s2.chaos = 0.7f; }); };
+                auto differs = [] (const RenderResult& a2, const RenderResult& b2)
+                {
+                    if (a2.segments.size() != b2.segments.size()) return true;
+                    for (size_t i = 0; i < a2.segments.size(); ++i)
+                        if (a2.segments[i].slot != b2.segments[i].slot
+                            || a2.segments[i].srcStart != b2.segments[i].srcStart) return true;
+                    return false;
+                };
+                auto four = fine (patFourFloor), roll = fine (patRolling), free = fine (patFree);
+                CHECK ((int) four->segments.size() >= 30, "1/4 rhythm on 1/32 really gives ~32 slices in a bar");
+                CHECK (differs (*four, *roll) && differs (*four, *free) && differs (*roll, *free),
+                       "and 4 to the floor, Rolling and Free still all sound different at 1/32");
+            }
+
+            // ... and every one of those 32 slices stays its own slice: locking one must change
+            // nothing at all, re-rolling one must change only that one, also in the middle of a
+            // note that slice size cut into pieces.
+            {
+                Settings sf; sf.bars = 2; sf.pattern = patFourFloor; sf.sliceSteps = 0.5;
+                sf.motifBars = 1; sf.variation = 0.3f; sf.chaos = 0.7f;
+                Arrangement af; af.seed = 8080;
+                auto hf = engine::buildHits (sf, af.seed);
+                af.resizeFor (hf.size());
+                af.regenerate (8080);
+                auto before2 = engine::render (prepared, enabled, sf, af, hf, hostBpm, hostRate);
+                auto shot = [] (const RenderResult& r)
+                {
+                    std::vector<juce::String> v;
+                    for (const auto& sg : r.segments)
+                        v.push_back (juce::String (sg.start) + ":" + juce::String (sg.slot) + ":"
+                                     + juce::String (sg.srcStart) + ":" + juce::String ((int) sg.reversed));
+                    return v;
+                };
+                const auto s0 = shot (*before2);
+                const size_t mid = juce::jmin (hf.size() - 1, (size_t) 5);   // a piece in the middle of a note
+                CHECK (hf[mid].subIndex > 1, "the slice we test on really is a later piece of a note");
+
+                af.setLocked (mid, true);
+                const auto s1 = shot (*engine::render (prepared, enabled, sf, af, hf, hostBpm, hostRate));
+                CHECK (s1 == s0, "locking a slice in the middle of a cut note changes nothing");
+
+                af.setLocked (mid, false);
+                af.reroll (mid, 7);
+                const auto s2 = shot (*engine::render (prepared, enabled, sf, af, hf, hostBpm, hostRate));
+                int moved = 0;
+                for (size_t i = 0; i < juce::jmin (s0.size(), s2.size()); ++i)
+                    moved += s0[i] != s2[i] ? 1 : 0;
+                std::cout << "     re-rolling one of 32 slices moved " << moved << " slices\n";
+                CHECK (s0.size() == s2.size() && moved == 1, "re-rolling one slice changes that slice and no other");
+            }
+
+            // STRETCH and TIME FEEL do their work when a sample is prepared, not when the loop is
+            // put together, so they are checked end to end in UITest.
+        }
+
+        // swing must never turn the loop inside out: whatever the rhythm and the slice size,
+        // the slices stay in order, keep a real length and stay inside the loop
+        {
+            int worstOverlap = 0, bad = 0;
+            for (int pat = 0; pat < 9; ++pat)
+                for (double size : { 0.5, 1.0, 2.0, 4.0, 8.0, 16.0 })
+                    for (float sw : { 0.25f, 0.6f, 1.0f })
+                    {
+                        auto r = renderWith (pat, size, [sw] (Settings& s2) { s2.swing = sw; });
+                        juce::int64 prevEnd = 0, prevStart = -1;
+                        for (const auto& sg : r->segments)
+                        {
+                            if (sg.start < prevStart || sg.length < 64 || sg.start + sg.length > r->audio.getNumSamples() + 1)
+                                ++bad;
+                            if (sg.start < prevEnd - 1)   // one sample is rounding, more is an overlap
+                                worstOverlap = juce::jmax (worstOverlap, (int) (prevEnd - sg.start));
+                            prevStart = sg.start;
+                            prevEnd = sg.start + sg.length;
+                        }
+                    }
+            std::cout << "     swing over 9 rhythms x 6 slice sizes x 3 amounts: " << bad
+                      << " bad slices, worst overlap " << worstOverlap << " samples\n";
+            CHECK (bad == 0 && worstOverlap == 0, "swing keeps every slice in order, in one piece and inside the loop");
+        }
+
+        // ---- and now everything door elkaar: knobs and lists never work one at a time -----
+        // A busy setting with all of it on at once, and then every knob on top of that: it still
+        // has to do something, and the loop has to stay whole.
+        {
+            auto busy = [] (Settings& s2)
+            {
+                s2.bars = 4; s2.pattern = patRolling; s2.sliceSteps = 0.5; s2.motifBars = 2;
+                s2.variation = 0.4f; s2.chaos = 0.5f; s2.gate = 0.7f; s2.swing = 0.55f;
+                s2.reverse = 0.2f; s2.octave = 0.2f; s2.fadeMs = 6.0f; s2.style = styleGlitch;
+                s2.amount = 0.7f; s2.fillBars = 4; s2.energy = 0.5f; s2.fit = 1.0f;
+                for (int i = 0; i < 16; ++i) s2.fitProfile[(size_t) i] = i % 4 == 0 ? 0.95f : 0.4f;
+            };
+            auto renderBusy = [&] (std::function<void (Settings&)> extra)
+            {
+                Settings s2; busy (s2); extra (s2);
+                Arrangement a2; a2.seed = 31337;
+                auto hh = engine::buildHits (s2, a2.seed);
+                a2.resizeFor (hh.size());
+                a2.regenerate (31337);
+                return engine::render (prepared, enabled, s2, a2, hh, hostBpm, hostRate);
+            };
+            auto allOn = renderBusy ([] (Settings&) {});
+            auto same = [] (const RenderResult& a2, const RenderResult& b2)
+            {
+                if (a2.audio.getNumSamples() != b2.audio.getNumSamples()) return false;
+                for (int i = 0; i < a2.audio.getNumSamples(); i += 5)
+                    if (std::abs (a2.audio.getSample (0, i) - b2.audio.getSample (0, i)) > 1.0e-4f) return false;
+                return true;
+            };
+            CHECK (same (*allOn, *renderBusy ([] (Settings&) {})), "with everything on at once the loop is still the same every time");
+
+            double rms = 0.0, peak = 0.0;
+            bool finite = true;
+            for (int i = 0; i < allOn->audio.getNumSamples(); ++i)
+            {
+                const double v = allOn->audio.getSample (0, i);
+                finite &= std::isfinite (v);
+                rms += v * v; peak = juce::jmax (peak, std::abs (v));
+            }
+            rms = std::sqrt (rms / juce::jmax (1, allOn->audio.getNumSamples()));
+            std::cout << "     everything on at once: rms " << juce::String (rms, 3) << ", peak "
+                      << juce::String (peak, 3) << ", " << allOn->segments.size() << " slices\n";
+            CHECK (finite && rms > 0.005 && peak < 1.5, "with everything on at once the loop still sounds, without junk in it");
+
+            // every knob, on top of that busy setting
+            const std::vector<std::pair<const char*, std::function<void (Settings&)>>> onTop {
+                { "CHAOS",     [] (Settings& s2) { s2.chaos = 1.0f; } },
+                { "VARIATION", [] (Settings& s2) { s2.variation = 1.0f; } },
+                { "GATE",      [] (Settings& s2) { s2.gate = 0.25f; } },
+                { "SWING",     [] (Settings& s2) { s2.swing = 1.0f; } },
+                { "AMOUNT",    [] (Settings& s2) { s2.amount = 0.2f; } },
+                { "REVERSE",   [] (Settings& s2) { s2.reverse = 1.0f; } },
+                { "OCTAVE",    [] (Settings& s2) { s2.octave = 1.0f; } },
+                { "FADE",      [] (Settings& s2) { s2.fadeMs = 25.0f; } },
+                { "ENERGY",    [] (Settings& s2) { s2.energy = 1.0f; } },
+                { "FIT",       [] (Settings& s2) { s2.fit = 2.0f; } },
+                { "SLICE SIZE",[] (Settings& s2) { s2.sliceSteps = 4.0; } },
+                { "RHYTHM",    [] (Settings& s2) { s2.pattern = patFourFloor; } },
+                { "REPEAT",    [] (Settings& s2) { s2.motifBars = 0; } },
+                { "FILL",      [] (Settings& s2) { s2.fillBars = 0; } },
+                { "STYLE",     [] (Settings& s2) { s2.style = styleLoFi; } },
+                { "SLICE MODE",[] (Settings& s2) { s2.sliceMode = 1; } },
+            };
+            for (const auto& k : onTop)
+                CHECK (! same (*allOn, *renderBusy (k.second)),
+                       juce::String (k.first) + " still does something with everything else on");
+        }
+
+        // 400 loops with every setting thrown together at random: nothing may fall apart
+        {
+            juce::uint64 rs = 0xC0FFEEull;
+            auto uniform = [] (juce::uint64& st)
+            {
+                st = st * 6364136223846793005ull + 1442695040888963407ull;
+                return (double) ((st >> 11) & ((1ull << 53) - 1)) / (double) (1ull << 53);
+            };
+            int bad = 0, silent = 0, notFinite = 0, worstOverlap = 0;
+            double loudest = 0.0;
+            for (int t = 0; t < 400; ++t)
+            {
+                auto pick = [&rs, &uniform] (int n) { return (int) (uniform (rs) * n) % n; };
+                Settings s2;
+                s2.bars = choices::lengthBars[pick (6)];
+                s2.pattern = pick (9);
+                s2.sliceMode = pick (2);
+                s2.sliceSteps = choices::sliceSteps[pick (6)];
+                s2.motifBars = choices::motifBars[pick (4)];
+                s2.sensitivity = (float) uniform (rs);
+                s2.chaos = (float) uniform (rs);
+                s2.variation = (float) uniform (rs);
+                s2.gate = 0.1f + 0.9f * (float) uniform (rs);
+                s2.swing = (float) uniform (rs);
+                s2.reverse = (float) uniform (rs);
+                s2.octave = (float) uniform (rs);
+                s2.fadeMs = 1.0f + 24.0f * (float) uniform (rs);
+                s2.style = pick (3);
+                s2.amount = (float) uniform (rs);
+                s2.stretchMode = pick (2);
+                s2.fillBars = choices::fillBars[pick (5)];
+                s2.energy = (float) uniform (rs);
+                s2.feel = pick (3);
+                s2.fit = 2.0f * (float) uniform (rs);
+                for (int i = 0; i < 16; ++i) s2.fitProfile[(size_t) i] = (float) uniform (rs);
+
+                Arrangement a2; a2.seed = 5000 + (juce::uint64) t;
+                auto hh = engine::buildHits (s2, a2.seed);
+                a2.resizeFor (hh.size());
+                a2.regenerate (a2.seed);
+                auto r = engine::render (prepared, enabled, s2, a2, hh, hostBpm, hostRate);
+
+                juce::int64 prevEnd = 0, prevStart = -1;
+                for (const auto& sg : r->segments)
+                {
+                    if (sg.start < prevStart || sg.length < 32 || sg.start + sg.length > r->audio.getNumSamples() + 1)
+                        ++bad;
+                    if (sg.start < prevEnd - 1) worstOverlap = juce::jmax (worstOverlap, (int) (prevEnd - sg.start));
+                    prevStart = sg.start;
+                    prevEnd = sg.start + sg.length;
+                }
+                const juce::int64 want = std::llround (s2.bars * 4.0 * hostRate * 60.0 / hostBpm);
+                if (r->audio.getNumSamples() != (int) want) ++bad;
+
+                double e = 0.0, pk = 0.0;
+                bool fin = true;
+                for (int i = 0; i < r->audio.getNumSamples(); ++i)
+                {
+                    const double v = r->audio.getSample (0, i);
+                    fin &= std::isfinite (v);
+                    e += v * v; pk = juce::jmax (pk, std::abs (v));
+                }
+                loudest = juce::jmax (loudest, pk);
+                if (! fin) ++notFinite;
+                if (std::sqrt (e / juce::jmax (1, r->audio.getNumSamples())) < 0.002) ++silent;
+            }
+            std::cout << "     400 random combinations: " << bad << " bad slices, " << silent
+                      << " silent, " << notFinite << " with junk, worst overlap " << worstOverlap
+                      << ", loudest peak " << juce::String (loudest, 2) << "\n";
+            CHECK (bad == 0 && worstOverlap == 0, "any combination of settings gives a whole loop");
+            CHECK (silent == 0 && notFinite == 0, "and no combination gives silence or junk");
+            CHECK (loudest < 1.5, "and none of them blows up the level");
+        }
+
+        // SENS is the odd one out: it decides which transients are found, so it only has a say
+        // in Transient slice mode (the knob is dimmed in the plug-in when it has none).
+        {
+            const double beatLen = hostRate * 60.0 / hostBpm;
+            const int low = (int) engine::detectOnsets (prepared[0].audio != nullptr ? *prepared[0].audio
+                                                                                     : juce::AudioBuffer<float>(), beatLen, 0.15f).size();
+            const int high = (int) engine::detectOnsets (prepared[0].audio != nullptr ? *prepared[0].audio
+                                                                                      : juce::AudioBuffer<float>(), beatLen, 0.9f).size();
+            std::cout << "     SENS 15% finds " << low << " transients, 90% finds " << high << "\n";
+            CHECK (low != high, "SENS changes which transients are found (Transient slice mode)");
+        }
     }
 
     // ------------------------------------------------------------------ 7. a longer 16-bar example

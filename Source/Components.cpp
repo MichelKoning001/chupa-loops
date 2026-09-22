@@ -650,7 +650,8 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
         powerButton.setVisible (false);
         transposeField.setVisible (false);
         playButton.setTooltip ("Listen to the part between the two lines, looping. Click again to stop.");
-        bpmField.setTooltip ("Tempo of your track. The fit grid is built on this, so correct it here if it is wrong.\n"
+        bpmField.setTooltip ("Tempo of your track - and with it the tempo of the loop: your track leads.\n"
+                             "Move it and the loop moves with it. Correct it here if it is wrong.\n"
                              "Drag up/down (Shift = fine), double-click = automatic.");
     }
     setTooltip (defaultTip());
@@ -660,7 +661,8 @@ juce::String SlotComponent::defaultTip() const
 {
     if (isTrack())
         return "Drop a part of your own song here (from Finder/Explorer or your DAW) or click to browse.\n"
-               "It is never sliced: the new loop leaves room where your track is busy, and KEY follows it.";
+               "It is never sliced: your track leads. The loop takes over its tempo and its key,\n"
+               "starts on the same one, and leaves room where your track is busy (FIT).";
     return "Drop a sample here (from Finder/Explorer, Splice or your DAW's browser) or click to browse.\n"
            "Drag the two lines over the waveform to use only a part of it.";
 }

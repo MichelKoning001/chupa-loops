@@ -96,6 +96,7 @@ struct Hit
     double lenSteps  = 1;
     int    bar       = 0;
     int    localIndex = 0;  // index within its bar
+    int    subIndex   = 0;  // 0 = the note itself, higher = a later piece of that same note
 };
 
 /** Per-hit random state. Everything the generator decides comes from these seeds,
@@ -244,7 +245,9 @@ namespace engine
                                          float amount, bool smooth, const std::atomic<bool>* abort = nullptr);
 
     /** How busy every 1/16 of a bar is in this audio (0..1 per step), for FIT TO TRACK. */
-    std::array<float, 16> gridProfile (const juce::AudioBuffer<float>&, double rate, double bpm);
+    std::array<float, 16> gridProfile (const juce::AudioBuffer<float>&, double rate, double bpm, int offset = -1);
+    /** Where bar one of a recording starts, in samples. -1 when there is no beat to find. */
+    int findDownbeat (const juce::AudioBuffer<float>&, double rate, double bpm);
 
     /** How good does this loop sound on paper? 0..1 (used by AUTO PICK). */
     double scoreLoop (const RenderResult&, double fillTargetScale = 1.0);

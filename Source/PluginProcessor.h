@@ -146,6 +146,13 @@ public:
     double getPlayPosition() const noexcept { return playPosition.load(); }   // 0..1, <0 = stopped
     bool   isBusy() const noexcept          { return busy.load(); }
     double getHostBpm() const noexcept      { return hostBpm.load(); }
+    /** The tempo the loop runs at. MY TRACK leads: as long as a part of your own track is
+        loaded, its tempo is the loop's tempo. Without it the DAW's tempo is followed. */
+    double getLoopBpm() const noexcept
+    {
+        const double t = trackBpm.load();
+        return juce::jlimit (40.0, 300.0, t >= 40.0 ? t : hostBpm.load());
+    }
     bool   hasHostTempo() const noexcept    { return hostProvidesTempo.load(); }
     void   setFallbackBpm (double);
 
@@ -265,6 +272,7 @@ private:
     std::atomic<int> pendingReferenceKey { -1 };   // slot whose key still has to be applied after loading
     std::atomic<int> keyBeforeReference { -1 };
     void updateFitFromSlots();
+    void updateTrackBpm();                 // MY TRACK leads: its tempo becomes the loop's tempo
     void applyReferenceKey (int slot);
     // background jobs on the worker thread (they need the prepared samples)
     std::atomic<int> autoPickRequest { 0 }, jobVersion { 0 };
@@ -277,6 +285,7 @@ private:
     void runAutoPick (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate, int candidates);
     void runStems (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate);
     std::atomic<double> hostBpm { defaultBpm }, fallbackBpm { defaultBpm }, currentRate { 0.0 }, playPosition { -1.0 };
+    std::atomic<double> trackBpm { 0.0 };    // MY TRACK's tempo, 0 when no track is loaded
     std::atomic<bool> standaloneStateRestored { false };   // the standalone reloads its last session once
     std::atomic<bool> editorEverOpened { false };          // ... and it does that before the window exists
     std::atomic<bool> keyRestoreWanted { false }, trackRegrid { false }, warpPreviewRearm { false };

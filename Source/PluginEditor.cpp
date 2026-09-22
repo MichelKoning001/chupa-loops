@@ -58,7 +58,7 @@ MainView::MainView (SliceTribeProcessor& p)
       chaos (p.apvts, "chaos", "Chaos", "Low: slices come from random places in your loops but keep their spot in the beat (the groove stays tight). High: anything goes."),
       variation (p.apvts, "variation", "Variation", "With Repeat on: how many slices change in every repeat of the motif."),
       gate (p.apvts, "gate", "Gate", "Note length. Lower = shorter, tighter, stabbier."),
-      swing (p.apvts, "swing", "Swing", "Pushes every second 1/16 back for a shuffle groove."),
+      swing (p.apvts, "swing", "Swing", "Pushes every second slice back for a shuffle groove (on the grid you slice on)."),
       amount (p.apvts, "amount", "Amount", "Strength of the Glitch or Lo-Fi style."),
       reverse (p.apvts, "reverse", "Reverse", "Chance that a slice plays backwards.", true),
       octave (p.apvts, "octave", "Octave", "Chance that a slice plays one octave up (+12).", true),
@@ -95,7 +95,9 @@ MainView::MainView (SliceTribeProcessor& p)
     lengthSel.setTooltip ("Length of the new loop in bars.");
     motifSel.setTooltip ("Repeats a 1, 2 or 4 bar motif through the loop so it stays musical. 'Off' = every bar is different.");
     modeSel.setTooltip ("Grid = cut on the beat grid. Transient = cut at every new note / attack.");
-    sizeSel.setTooltip ("Slice size (in 'Free') and the grid random positions are picked from.");
+    sizeSel.setTooltip ("How big one slice is. Works on every rhythm: a 1/4 note on 1/32 becomes\n"
+                        "eight slices, so you can have 32 slices in a bar. It is also the grid that\n"
+                        "positions in the sample are picked from, and the grid Swing works on.");
     stretchSel.setTooltip ("How loops at another tempo are fitted.\nBeats: re-sliced on the grid - attacks and gaps stay exactly as recorded (best for basslines).\nSmooth: time-stretched - best for long legato notes and pads.");
     styleSel.setTooltip ("Clean: seamless, phase-aligned crossfades.\nGlitch: stutters, tape stops and chops.\nLo-Fi: crunchy vintage sampler.");
     fillSel.setTooltip ("Fill: the last half bar of every 4, 8, 16 or 32 bars becomes a stutter roll, like a drummer's fill at the end of a phrase.\n"
@@ -873,13 +875,19 @@ void MainView::updateState()
     backButton.setEnabled (proc.getHistoryPosition() > 0);
     forwardButton.setEnabled (proc.getHistoryPosition() < proc.getHistorySize() - 1);
 
-    const bool hostTempo = proc.hasHostTempo();
-    tempoField.setValue (proc.getHostBpm());
-    if (tempoField.locked != hostTempo)
+    // the tempo the loop really runs at: your own track's when one is loaded, otherwise the DAW's
+    const bool trackLeads = proc.getLoopBpm() != proc.getHostBpm() || proc.getSlotInfo (kTrackSlot).loaded;
+    const bool tempoLocked = proc.hasHostTempo() || trackLeads;
+    tempoField.setValue (proc.getLoopBpm());
+    const juce::String tempoTag = trackLeads ? "TRACK" : "SYNC";
+    if (tempoField.locked != tempoLocked || tempoField.lockedTag != tempoTag)
     {
-        tempoField.locked = hostTempo;
-        tempoField.setMouseCursor (hostTempo ? juce::MouseCursor::NormalCursor : juce::MouseCursor::UpDownResizeCursor);
-        tempoField.setTooltip (hostTempo ? "Tempo follows your DAW" : "Tempo: drag up/down (Shift = fine) or double-click to type");
+        tempoField.locked = tempoLocked;
+        tempoField.lockedTag = tempoTag;
+        tempoField.setMouseCursor (tempoLocked ? juce::MouseCursor::NormalCursor : juce::MouseCursor::UpDownResizeCursor);
+        tempoField.setTooltip (trackLeads ? "Tempo follows your own track (MY TRACK). Change it on the track box."
+                             : tempoLocked ? "Tempo follows your DAW"
+                                           : "Tempo: drag up/down (Shift = fine) or double-click to type");
         tempoField.repaint();
     }
 
@@ -917,9 +925,10 @@ void MainView::updateState()
 
     const auto st = proc.readSettings();
     const bool sensOn = st.sliceMode == 1, varOn = st.motifBars > 0 && st.motifBars < st.bars, amountOn = st.style != styleClean;
-    sensitivity.setAlpha (sensOn ? 1.0f : 0.4f);
-    variation.setAlpha (varOn ? 1.0f : 0.4f);
-    amount.setAlpha (amountOn ? 1.0f : 0.4f);
+    // a knob that has no say right now is clearly switched off, not just a little paler
+    sensitivity.setAlpha (sensOn ? 1.0f : 0.28f);
+    variation.setAlpha (varOn ? 1.0f : 0.28f);
+    amount.setAlpha (amountOn ? 1.0f : 0.28f);
     sensitivity.slider.setTooltip (juce::String ("Transient detection sensitivity.") + (sensOn ? "" : "\nOnly used in Transient slice mode.") + "\n(Shift-drag = fine, double-click = default, right-click = MIDI learn)");
     variation.slider.setTooltip (juce::String ("How many slices change in every repeat of the motif.") + (varOn ? "" : "\nOnly used when Repeat is on (and shorter than the loop).") + "\n(Shift-drag = fine, double-click = default, right-click = MIDI learn)");
     amount.slider.setTooltip (juce::String ("Strength of the Glitch or Lo-Fi style.") + (amountOn ? "" : "\nOnly used with Glitch or Lo-Fi.") + "\n(Shift-drag = fine, double-click = default, right-click = MIDI learn)");

@@ -18,6 +18,7 @@ struct FakeHost : juce::AudioPlayHead
         p.setBpm (bpm);
         p.setPpqPosition (ppq);
         p.setIsPlaying (playing);
+        p.setTimeInSeconds (bpm > 0.0 ? ppq * 60.0 / bpm : 0.0);
         p.setTimeSignature (TimeSignature { 4, 4 });
         return p;
     }
@@ -634,6 +635,23 @@ int main (int argc, char** argv)
                 int fromRef = 0;
                 for (const auto& sg : withFit->segments) fromRef += sg.slot == kTrackSlot ? 1 : 0;
                 CHECK (fromRef == 0, "no slices are taken from your own track");
+
+                // MY TRACK leads, like Splice: its tempo is the loop's tempo, not the DAW's
+                std::cout << "     DAW " << proc->getHostBpm() << " bpm, your track 140 bpm -> loop "
+                          << proc->getLoopBpm() << " bpm\n";
+                CHECK (std::abs (proc->getHostBpm() - 140.0) > 1.0 && std::abs (proc->getLoopBpm() - 140.0) < 0.5,
+                       "your own track's tempo becomes the loop's tempo, not the DAW's");
+                CHECK (std::abs (withFit->bpm - 140.0) < 0.5, "and the loop is really rendered at that tempo");
+                {
+                    const int vb = proc->getResultVersion();
+                    proc->setSlotBpm (kTrackSlot, 128.0);
+                    CHECK (waitFor (*proc, vb + 1, 30000) && std::abs (proc->getDisplayResult()->bpm - 128.0) < 0.5,
+                           "move your track's tempo and the loop moves with it");
+                    const int vb2 = proc->getResultVersion();
+                    proc->setSlotBpm (kTrackSlot, 0.0);
+                    waitFor (*proc, vb2 + 1, 30000);
+                    CHECK (std::abs (proc->getLoopBpm() - 140.0) < 0.5, "back to automatic: the track's own tempo again");
+                }
 
                 auto onBeatShare = [] (const RenderResult& r)
                 {
@@ -1569,6 +1587,146 @@ int main (int argc, char** argv)
         b13.clear();
         p13->processBlock (b13, m13);
         CHECK (std::abs (p13->getHostBpm() - 174.0) < 0.01, "the tempo you set without a DAW comes back with the project");
+    }
+
+    // ---- the FX section, and everything that only does its work inside the plug-in ----------
+    {
+        auto pf = std::make_unique<SliceTribeProcessor>();
+        FakeHost fh;
+        fh.bpm = 140.0;
+        pf->setPlayHead (&fh);
+        pf->prepareToPlay (48000.0, 512);
+        for (int i = 0; i < juce::jmin (3, files.size()); ++i)
+            pf->loadSlot (i, files[i]);
+        CHECK (waitFor (*pf, 1, 30000), "a loop to test the FX on");
+
+        auto set = [&] (const char* id, float value)
+        {
+            auto* prm = pf->apvts.getParameter (id);
+            prm->setValueNotifyingHost (prm->convertTo0to1 (value));
+        };
+        auto play = [&] (juce::AudioBuffer<float>& into)
+        {
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            fh.playing = true;
+            fh.ppq = 0.0;
+            runHost (*pf, fh, 4 * 60.0 / 140.0, &into);
+            fh.playing = false;
+        };
+        auto differs = [] (const juce::AudioBuffer<float>& a2, const juce::AudioBuffer<float>& b2)
+        {
+            if (a2.getNumSamples() != b2.getNumSamples()) return true;
+            for (int i = 500; i < a2.getNumSamples(); i += 3)
+                for (int c = 0; c < a2.getNumChannels(); ++c)
+                    if (std::abs (a2.getSample (c, i) - b2.getSample (c, i)) > 1.0e-4f) return true;
+            return false;
+        };
+
+        juce::AudioBuffer<float> dry;
+        play (dry);
+
+        struct Fx { const char* id; float def; float on; const char* name; };
+        const std::vector<Fx> fx {
+            { "fxCutoff", 100.0f, 25.0f, "CUTOFF" }, { "fxReso",  0.0f, 80.0f, "RESO" },
+            { "fxEnv",    0.0f,   80.0f, "ENV" },    { "fxDecay", 50.0f, 95.0f, "DECAY" },
+            { "fxLowCut", 0.0f,   60.0f, "LOW CUT" },{ "fxDrive", 0.0f, 80.0f, "DRIVE" },
+            { "fxPump",   0.0f,   80.0f, "PUMP" },
+            { "gain",     0.0f,  -9.0f,  "VOLUME" },
+        };
+        for (const auto& f : fx)
+        {
+            if (juce::String (f.id) == "fxDecay")   // decay only has a say once Env is open
+                set ("fxEnv", 80.0f);
+            if (juce::String (f.id) == "fxReso")
+                set ("fxCutoff", 40.0f);
+            juce::AudioBuffer<float> before2, after2;
+            set (f.id, f.def);
+            play (before2);
+            set (f.id, f.on);
+            play (after2);
+            CHECK (differs (before2, after2), juce::String (f.name) + " changes the sound");
+            set (f.id, f.def);
+            set ("fxEnv", 0.0f);
+            set ("fxCutoff", 100.0f);
+        }
+
+        // WIDTH and KEY need material that has something to work on: a real stereo sample with
+        // a key in its name (WIDTH on a mono sample does nothing, and rightly so)
+        {
+            const double rate = 48000.0;
+            const int len = (int) (4 * 4 * 60.0 / 140.0 * rate);
+            juce::AudioBuffer<float> st (2, len);
+            for (int i = 0; i < len; ++i)
+            {
+                const double t = i / rate;
+                const double env = std::exp (-std::fmod (t, 60.0 / 140.0) * 4.0);
+                st.setSample (0, i, (float) (0.35 * std::sin (juce::MathConstants<double>::twoPi * 110.0 * t) * env));
+                st.setSample (1, i, (float) (0.35 * std::sin (juce::MathConstants<double>::twoPi * 138.6 * t + 1.1) * env));
+            }
+            auto stereoFile = out.getChildFile ("StereoTest_Am_140bpm.wav");
+            engine::writeWav (stereoFile, st, rate, 1.0f);
+            for (int i = 1; i < kNumSlots; ++i)
+                pf->clearSlot (i);
+            pf->loadSlot (0, stereoFile);
+            for (int t = 0; t < 100 && ! pf->getSlotInfo (0).loaded; ++t)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+            waitFor (*pf, pf->getResultVersion() + 1, 30000);
+
+            juce::AudioBuffer<float> narrow, wide;
+            set ("fxWidth", 100.0f);
+            play (narrow);
+            set ("fxWidth", 180.0f);
+            play (wide);
+            CHECK (differs (narrow, wide), "WIDTH changes the sound (on stereo material)");
+            set ("fxWidth", 0.0f);
+            juce::AudioBuffer<float> mono;
+            play (mono);
+            bool isMono = true;
+            for (int i = 12000; i < mono.getNumSamples() && isMono; i += 3)
+                isMono = std::abs (mono.getSample (0, i) - mono.getSample (1, i)) < 1.0e-4f;
+            CHECK (isMono, "and WIDTH at 0% really gives mono");
+            set ("fxWidth", 100.0f);
+
+            const int v0 = pf->getResultVersion();
+            auto off = pf->getDisplayResult()->audio;
+            set ("key", 6);                        // force everything into one key
+            waitFor (*pf, v0 + 1, 30000);
+            CHECK (differs (off, pf->getDisplayResult()->audio), "KEY changes the loop");
+            set ("key", 0.0f);
+            waitFor (*pf, pf->getResultVersion() + 1, 30000);
+        }
+
+        // STRETCH and TIME FEEL are done when a sample is prepared, so they show up in the loop
+        auto loopAudio = [&] ()
+        {
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            auto res = pf->getDisplayResult();
+            return res != nullptr ? res->audio : juce::AudioBuffer<float>();
+        };
+        {
+            const int v0 = pf->getResultVersion();
+            auto beats = loopAudio();
+            set ("stretch", 1);                    // Smooth
+            waitFor (*pf, v0 + 1, 30000);
+            auto smooth = loopAudio();
+            CHECK (differs (beats, smooth), "STRETCH Beats and Smooth really sound different");
+            set ("stretch", 0);
+            waitFor (*pf, pf->getResultVersion() + 1, 30000);
+        }
+        for (int fe = 1; fe <= 2; ++fe)
+        {
+            const int v0 = pf->getResultVersion();
+            auto normal = loopAudio();
+            set ("feel", (float) fe);
+            waitFor (*pf, v0 + 1, 30000);
+            auto changed = loopAudio();
+            CHECK (differs (normal, changed),
+                   juce::String ("TIME FEEL ") + (fe == 1 ? "half time" : "double time") + " changes the loop");
+            set ("feel", 0.0f);
+            waitFor (*pf, pf->getResultVersion() + 1, 30000);
+        }
+        pf->setPlayHead (nullptr);
+        pf->releaseResources();
     }
 
     writeSetting ("tourDone", tourSetting);

@@ -1213,14 +1213,17 @@ std::vector<int> engine::detectOnsets (const juce::AudioBuffer<float>& b, double
 //==============================================================================
 namespace
 {
-    using BarPattern = std::vector<std::pair<double, double>>;   // start, length (1/16 steps)
+    /** One note of a rhythm: where it falls, how long it is, and - once slice size has cut it
+        into pieces - which piece of that note this is (0 = the note's own start). */
+    struct BarHit { double start = 0.0, len = 0.0; int sub = 0; };
+    using BarPattern = std::vector<BarHit>;                      // in 1/16 steps
 
     BarPattern perBeat (std::initializer_list<std::pair<double, double>> beat)
     {
         BarPattern p;
         for (int b = 0; b < 4; ++b)
             for (auto& h : beat)
-                p.push_back ({ b * 4.0 + h.first, h.second });
+                p.push_back ({ b * 4.0 + h.first, h.second, 0 });
         return p;
     }
 
@@ -1234,7 +1237,7 @@ namespace
             case patRolling:       return perBeat ({ { 0, 1 }, { 1, 1 }, { 2, 1 }, { 3, 1 } });
             case patRollingKBBB:   return perBeat ({ { 1, 1 }, { 2, 1 }, { 3, 1 } });
             case patGallop:        return perBeat ({ { 0, 2 }, { 2, 1 }, { 3, 1 } });
-            case patBroken:        return { { 0, 3 }, { 3, 3 }, { 6, 2 }, { 10, 1 }, { 11, 3 }, { 14, 2 } };
+            case patBroken:        return { { 0, 3, 0 }, { 3, 3, 0 }, { 6, 2, 0 }, { 10, 1, 0 }, { 11, 3, 0 }, { 14, 2, 0 } };
             case patRandom:
             {
                 BarPattern p;
@@ -1247,13 +1250,13 @@ namespace
                         const double r = uniform (st);
                         double len = r < 0.55 ? 1.0 : (r < 0.88 ? 2.0 : 3.0);
                         len = juce::jmin (len, 16.0 - pos);
-                        p.push_back ({ pos, len });
+                        p.push_back ({ pos, len, 0 });
                         pos += len;
                     }
                     else
                         pos += 1.0;
                 }
-                if (p.empty()) p.push_back ({ 0, 2 });
+                if (p.empty()) p.push_back ({ 0, 2, 0 });
                 return p;
             }
             case patFree:
@@ -1262,10 +1265,38 @@ namespace
                 BarPattern p;
                 const double step = juce::jlimit (0.5, 16.0, s.sliceSteps);
                 for (double pos = 0; pos < 16.0 - 1.0e-9; pos += step)
-                    p.push_back ({ pos, step });
+                    p.push_back ({ pos, step, 0 });
                 return p;
             }
         }
+    }
+
+    // Slice size says how big one piece of audio is. The rhythm says where a note falls, slice
+    // size says in how many pieces that note is heard: a 1/4 note with slice size 1/32 becomes
+    // eight slices, so a four-to-the-floor bar gives you 32 slices. A note shorter than the size
+    // you picked stays as it is - the rhythm keeps its own length. Free builds its grid straight
+    // from the slice size, so there there is nothing left to do.
+    BarPattern applySliceSize (const Settings& s, const BarPattern& p)
+    {
+        if (s.pattern == patFree)
+            return p;
+
+        const double size = juce::jlimit (0.5, 16.0, s.sliceSteps);
+        BarPattern out;
+        out.reserve (p.size() * 2);
+        for (const auto& h : p)
+        {
+            if (h.len <= size + 1.0e-9)
+            {
+                out.push_back (h);
+                continue;
+            }
+            const double end = h.start + h.len;
+            int sub = 1;   // 1 = the start of a cut note, higher = its later pieces
+            for (double pos = h.start; pos < end - 1.0e-6; pos += size)
+                out.push_back ({ pos, juce::jmin (size, end - pos), sub++ });
+        }
+        return out;
     }
 
     int motifLength (const Settings& s)
@@ -1279,7 +1310,7 @@ std::vector<Hit> engine::buildHits (const Settings& s, juce::uint64 seed)
     const int M = motifLength (s);
     std::vector<BarPattern> bars;
     for (int b = 0; b < M; ++b)
-        bars.push_back (makeBar (s, seed, b));
+        bars.push_back (applySliceSize (s, makeBar (s, seed, b)));
 
     std::vector<Hit> hits;
     for (int b = 0; b < s.bars; ++b)
@@ -1288,10 +1319,11 @@ std::vector<Hit> engine::buildHits (const Settings& s, juce::uint64 seed)
         for (size_t k = 0; k < bp.size(); ++k)
         {
             Hit h;
-            h.startStep  = b * 16.0 + bp[k].first;
-            h.lenSteps   = bp[k].second;
+            h.startStep  = b * 16.0 + bp[k].start;
+            h.lenSteps   = bp[k].len;
             h.bar        = b;
             h.localIndex = (int) k;
+            h.subIndex   = bp[k].sub;
             hits.push_back (h);
         }
     }
@@ -1485,7 +1517,9 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             if (hits[i].bar >= 0 && ! inFill (hits[i]))
                 perBar[(size_t) hits[i].bar].push_back (i);
 
-        auto stepOf = [&hits] (size_t i) { return juce::jlimit (0, 15, ((int) std::llround (hits[i].startStep)) % 16); };
+        // which 1/16 of the bar a hit falls in - a 1/32 hit belongs to the step it starts in,
+        // so floor, not round (2.5 is still the third 1/16, not the fourth)
+        auto stepOf = [&hits] (size_t i) { return juce::jlimit (0, 15, ((int) std::floor (hits[i].startStep)) % 16); };
         auto busyAt = [&s, &stepOf] (size_t i) { return s.fitProfile[(size_t) stepOf (i)]; };
         // when your track is equally busy everywhere, keep the strong beats: 1 first, then 3, then 2 and 4
         auto beatStrength = [&stepOf] (size_t i)
@@ -1572,12 +1606,24 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         const double uRev   = uniform (rt);
         const double uOct   = uniform (rt);
 
-        // swing moves every odd 1/16; a hit ends where the (possibly swung) next position starts
+        // Swing pushes every second slice a little later - on the grid you are slicing on, so it
+        // works on every rhythm and every slice size (1/8 slices swing the 1/8s, 1/16 the 1/16s).
+        // A hit ends where the (possibly swung) next position starts.
+        // It bends time instead of moving single hits: every second slice lands later, and
+        // everything in between slides along with it. So the order and the length of the slices
+        // always stay right, however fine the rhythm is.
+        const double swingUnit = juce::jlimit (0.5, 8.0, s.sliceSteps);
         auto swungPos = [&] (double step)
         {
-            const double r = std::round (step);
-            const bool odd = std::abs (step - r) < 1.0e-6 && ((juce::int64) r) % 2 != 0;
-            return step * stepLen + (odd ? s.swing * 0.5 * stepLen : 0.0);
+            if (s.swing <= 0.0001f)
+                return step * stepLen;
+            const double u = swingUnit, period = 2.0 * u;
+            const double d = juce::jlimit (0.0, 0.49, (double) s.swing * 0.5) * u;   // how far the off-beat moves
+            const double k = std::floor (step / period);
+            const double x = step - k * period;                                      // 0 .. 2u
+            const double y = x <= u ? x * (u + d) / u
+                                    : u + d + (x - u) * (u - d) / u;
+            return (k * period + y) * stepLen;
         };
         const double startPos = swungPos (hit.startStep);
         const double endPos   = swungPos (hit.startStep + hit.lenSteps);
@@ -1652,7 +1698,9 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             }
             else
             {
-                const double sliceBeats = juce::jmax (0.125, s.sliceSteps / 4.0);
+                // chaos: a position anywhere in the sample. Never coarser than a 1/16, otherwise
+                // with big slices it would land on the beat again and you would hear nothing of it.
+                const double sliceBeats = juce::jlimit (0.125, 0.25, s.sliceSteps / 4.0);
                 const int numSlices = juce::jmax (1, (int) std::floor (loopBeats / sliceBeats + 1.0e-6));
                 // a window smaller than one slice: start anywhere inside it instead of always at the end
                 beatsOut = winEnd - base < sliceBeats ? base + posDraw * juce::jmax (0.0, winEnd - base)
@@ -1681,7 +1729,12 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         };
 
         const bool octaveOn = uOct < s.octave;
-        const bool keepPos = uChaos >= s.chaos;
+        // The first piece of a note that slice size cut up lands on the beat of its own sample,
+        // the pieces after it are free. That way a 1/4 rhythm on 1/32 really is four chopped
+        // quarter notes and not 32 loose slices: you keep hearing the rhythm you picked, however
+        // fine you slice. It is decided per slice, so locking or re-rolling one slice never
+        // moves another one.
+        const bool keepPos = hit.subIndex == 1 || uChaos >= s.chaos;
         int slot = 0;
         double beats = 0.0;
         choose (uSlot, uPos, keepPos, octaveOn, slot, beats);
@@ -1730,10 +1783,12 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         bool fitSkip = false;
         if (s.fit > 0.001f && ! isLocked && ! fitProtected[h] && ! inFill (hit))   // a fill always stays
         {
-            const int step = ((int) std::llround (hit.startStep)) % 16;
+            const int step = ((int) std::floor (hit.startStep)) % 16;
             const float busy = s.fitProfile[(size_t) juce::jlimit (0, 15, step)];
             juce::uint64 ft = hashCombine (rt, 0xF17ull);
-            fitSkip = busy > 0.35f && uniform (ft) < juce::jlimit (0.0, 0.95, (double) (s.fit * (busy - 0.35f) / 0.65f));
+            // 100% leaves room, it does not wipe the loop out: on the busiest spot of your track
+            // three out of four slices make way and one still goes. 200% really clears the way.
+            fitSkip = busy > 0.35f && uniform (ft) < juce::jlimit (0.0, 0.95, (double) (0.75f * s.fit * (busy - 0.35f) / 0.65f));
         }
 
         // energy: the further into the loop, the more glitch, octaves and reverses
@@ -2295,7 +2350,55 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
 //==============================================================================
 /** Where does this audio have its weight inside a bar? One value per 1/16 step, 0..1.
     Used by FIT TO TRACK: the new loop leaves room where your own track is busy. */
-std::array<float, 16> engine::gridProfile (const juce::AudioBuffer<float>& b, double rate, double bpm)
+/** Where bar one of a recording starts. Finds the beat grid, then picks the beat of every four
+    that carries the most low end - that is where the bar begins. -1 when there is no beat. */
+int engine::findDownbeat (const juce::AudioBuffer<float>& b, double rate, double bpm)
+{
+    if (b.getNumSamples() < 2048 || b.getNumChannels() < 1 || bpm < 20.0 || bpm > 400.0)
+        return -1;
+    int beats = 0;
+    double gridOffset = 0.0;
+    auto anchors = findBeats (b, rate, bpm, beats, &gridOffset);
+    if (beats < 2 || anchors.empty())
+        return -1;
+
+    const double beatLen = rate * 60.0 / bpm;
+    const int win = juce::jmax (64, (int) (rate * 0.06));
+    std::array<double, 4> energy {};
+    std::array<int, 4> count {};
+    for (int k = 0; k <= beats; ++k)
+    {
+        const int pos = k < (int) anchors.size() && anchors[(size_t) k] >= 0
+                            ? anchors[(size_t) k] : (int) std::llround (gridOffset + k * beatLen);
+        if (pos < 0 || pos + 128 >= b.getNumSamples())
+            continue;
+        const int n = juce::jmin (win, b.getNumSamples() - pos);
+        double e = 0.0;
+        for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        {
+            const float* d = b.getReadPointer (ch) + pos;
+            double lp = 0.0;
+            for (int i = 0; i < n; ++i) { lp += 0.02 * (d[i] - lp); e += lp * lp; }   // the low end only
+        }
+        energy[(size_t) (k % 4)] += e / juce::jmax (1, n * b.getNumChannels());
+        ++count[(size_t) (k % 4)];
+    }
+    int best = 0;
+    double bestE = -1.0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const double avg = count[(size_t) i] > 0 ? energy[(size_t) i] / count[(size_t) i] : 0.0;
+        if (avg > bestE) { bestE = avg; best = i; }
+    }
+    const double bar = 4.0 * beatLen;
+    double start = gridOffset + best * beatLen;
+    while (start < 0.0)        start += bar;
+    while (start >= bar)       start -= bar;
+    return (int) std::llround (start);
+}
+
+
+std::array<float, 16> engine::gridProfile (const juce::AudioBuffer<float>& b, double rate, double bpm, int offsetIn)
 {
     std::array<float, 16> out {};
     const int n = b.getNumSamples();
@@ -2305,9 +2408,10 @@ std::array<float, 16> engine::gridProfile (const juce::AudioBuffer<float>& b, do
     const double stepLen = rate * 60.0 / bpm / 4.0;         // one 1/16 in samples
     const int win = juce::jlimit (64, (int) stepLen, (int) (rate * 0.045));   // 45 ms from every step
 
-    // where does the music start? A loop that was trimmed a little late would otherwise
-    // put its downbeat on the wrong step.
-    int offset = 0;
+    // where does bar one of your track start? Everything is measured from there, so step 0 of the
+    // profile really is the one. The caller normally passes it in (found by findDownbeat).
+    int offset = offsetIn >= 0 ? juce::jlimit (0, juce::jmax (0, n - 64), offsetIn) : 0;
+    if (offsetIn < 0)
     {
         const int hop = juce::jmax (32, (int) (rate * 0.005));
         double loudest = 0.0;

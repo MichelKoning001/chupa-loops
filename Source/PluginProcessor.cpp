@@ -370,7 +370,7 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // ---- host transport ------------------------------------------------------
     double bpm = fallbackBpm.load();
     bool hostPlaying = false;
-    std::optional<double> ppq;
+    std::optional<double> ppq, timeSecs;
     bool tempoFromHost = false;
 
     if (auto* ph = getPlayHead())
@@ -385,13 +385,33 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             hostPlaying = pos->getIsPlaying();
             if (auto p = pos->getPpqPosition())
                 ppq = *p;
+            if (auto t = pos->getTimeInSeconds())
+                timeSecs = *t;
         }
     }
     hostProvidesTempo = tempoFromHost;
     if (std::abs (bpm - hostBpm.load()) > 1.0e-3)
     {
         hostBpm = bpm;
-        upToDate = false;
+        if (trackBpm.load() < 40.0)
+            upToDate = false;   // without your own track the loop follows the DAW
+    }
+
+    // MY TRACK leads. With a part of your own track loaded, the loop runs at that track's tempo
+    // instead of the DAW's, and beat one of the loop falls on beat one of the project - so the
+    // two run side by side, both starting on the 1. Move the track's tempo and the loop moves
+    // with it. Without a track nothing changes: the DAW's tempo and the DAW's grid.
+    const double hostTempo = juce::jlimit (40.0, 300.0, bpm);
+    const bool trackLeads = trackBpm.load() >= 40.0;
+    bpm = getLoopBpm();
+    if (trackLeads)
+    {
+        // Count in the project's own time, not in its beats: with a tempo change or a tempo ramp
+        // in the project the loop would otherwise jump. Second 0 of the project is the one.
+        if (timeSecs.has_value())
+            ppq = *timeSecs * bpm / 60.0;
+        else if (ppq.has_value() && hostTempo > 1.0e-6)
+            ppq = *ppq * (bpm / hostTempo);
     }
 
     // Offline bounce/export: the host does not need real time, so wait for the engine to finish
@@ -942,10 +962,14 @@ void SliceTribeProcessor::run()
                 if (a.name.isEmpty()) a.name = "Sample " + juce::String (i + 1);
                 const double seconds = a.original->getNumSamples() / a.fileRate;
                 a.detectedBpm = job.detectedBpm > 0.0 ? job.detectedBpm
-                                                      : engine::detectBpm (a.name, seconds, juce::jlimit (40.0, 300.0, hostBpm.load()),
+                                                      : engine::detectBpm (a.name, seconds, getLoopBpm(),
                                                                           a.original.get(), a.fileRate);
-                a.gridProfile = engine::gridProfile (*a.original, a.fileRate,                   // for FIT TO TRACK
-                                                    job.state.bpmOverride > 0.0 ? job.state.bpmOverride : a.detectedBpm);
+                if (i == kTrackSlot)   // for FIT TO TRACK, measured from your track's own bar one
+                {
+                    const double gb = job.state.bpmOverride > 0.0 ? job.state.bpmOverride : a.detectedBpm;
+                    a.gridProfile = engine::gridProfile (*a.original, a.fileRate, gb,
+                                                         engine::findDownbeat (*a.original, a.fileRate, gb));
+                }
                 if (fromEmbedded)
                     emb = job.embedded;
                 else if (seconds <= maxEmbedSeconds)
@@ -983,7 +1007,7 @@ void SliceTribeProcessor::run()
         }
 
         const double rate = currentRate.load();
-        const double bpm  = juce::jlimit (40.0, 300.0, hostBpm.load());
+        const double bpm  = getLoopBpm();   // MY TRACK leads when it is loaded
         if (rate <= 0.0)
         {
             busy = false;
@@ -1470,7 +1494,8 @@ SlotInfo SliceTribeProcessor::getSlotInfo (int i) const
     info.peaks = a.peaks;
     const double feel = choices::feelFactor[juce::jlimit (0, 2, (int) apvts.getRawParameterValue ("feel")->load())];
     const double src = (st.bpmOverride > 0 ? st.bpmOverride : a.detectedBpm) * feel;
-    info.stretchRatio = src > 0 ? hostBpm.load() / src : 1.0;
+    info.stretchRatio = i == kTrackSlot ? 1.0                    // your own track is never stretched
+                      : src > 0 ? getLoopBpm() / src : 1.0;
     return info;
 }
 
@@ -1657,7 +1682,10 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
         editSlotState (slot, [bpm] (SlotState& s2) { s2.bpmOverride = bpm > 0 ? juce::jlimit (40.0, 300.0, bpm) : 0.0; });
     }
     if (slot == kTrackSlot)
+    {
         trackRegrid = true;   // the fit grid follows the corrected tempo (measured by the worker)
+        updateTrackBpm();     // ... and so does the loop: move your track's tempo, the loop moves with it
+    }
     prepareInterrupt = true;
     slotsVersion.fetch_add (1);
     requestUpdate();
@@ -1728,16 +1756,18 @@ void SliceTribeProcessor::regridTrack()
     const int s1 = juce::jlimit (s0, n, (int) (a1 * n));
     if (s1 - s0 >= 256 && bpm > 0.0)
     {
+        // where bar one of your track is: everything is measured from there, so step 0 of the
+        // profile really is the one - and the loop's one lands on your track's one.
         if (s0 == 0 && s1 == n)
         {
-            profile = engine::gridProfile (*audio, fileRate, bpm);
+            profile = engine::gridProfile (*audio, fileRate, bpm, engine::findDownbeat (*audio, fileRate, bpm));
         }
         else
         {
             juce::AudioBuffer<float> part (audio->getNumChannels(), s1 - s0);
             for (int ch = 0; ch < part.getNumChannels(); ++ch)
                 part.copyFrom (ch, 0, *audio, ch, s0, s1 - s0);
-            profile = engine::gridProfile (part, fileRate, bpm);
+            profile = engine::gridProfile (part, fileRate, bpm, engine::findDownbeat (part, fileRate, bpm));
         }
     }
     {
@@ -1747,9 +1777,32 @@ void SliceTribeProcessor::regridTrack()
     }
 }
 
+/** MY TRACK leads: as long as a track is loaded, its tempo is the tempo of the loop. */
+void SliceTribeProcessor::updateTrackBpm()
+{
+    double t = 0.0;
+    {
+        const juce::ScopedLock sl (slotLock);
+        const auto& a = slotAudio[(size_t) kTrackSlot];
+        const auto& st = slotState[(size_t) kTrackSlot];
+        if (a.original != nullptr)
+            t = st.bpmOverride > 0.0 ? st.bpmOverride : a.detectedBpm;
+    }
+    if (t > 0.0 && (t < 40.0 || t > 300.0))
+        t = juce::jlimit (40.0, 300.0, t);
+    if (std::abs (t - trackBpm.load()) > 1.0e-6)
+    {
+        trackBpm = t;
+        prepareInterrupt = true;   // everything is stretched to the new tempo
+        upToDate = false;
+        requestUpdate();
+    }
+}
+
 /** Collects your own track's profile into the lock-free copy the render settings read. */
 void SliceTribeProcessor::updateFitFromSlots()
 {
+    updateTrackBpm();
     int ref = -1;
     {
         const juce::ScopedLock wl (fitWriteLock);   // worker and message thread both call this
@@ -2210,7 +2263,7 @@ juce::String SliceTribeProcessor::suggestedExportName() const
 {
     auto r = getDisplayResult();
     const auto s = readSettings();
-    const double bpm = r != nullptr ? r->bpm : hostBpm.load();
+    const double bpm = r != nullptr ? r->bpm : getLoopBpm();
     const int bars = r != nullptr ? r->bars : s.bars;
     return juce::File::createLegalFileName ("Chupa Loops " + juce::String (juce::roundToInt (bpm)) + "bpm " + juce::String (bars) + "bars "
                                             + choices::patterns[s.pattern] + (s.style != styleClean ? " " + choices::styles[s.style] : juce::String()));
