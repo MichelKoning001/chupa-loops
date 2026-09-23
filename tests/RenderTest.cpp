@@ -456,19 +456,71 @@ int main()
         CHECK (changedOthers > 5, "unlocked slices change on regenerate");
     }
 
+    // ------------------------------------------------------------------ 6a. the last slice is yours too
+    // "every sample has to be heard" hands one slice over to a sample that drew nothing. That must
+    // never land on the same slice every time (it was always the last one), and never on a slice
+    // you clicked yourself - otherwise that one slice can never be changed.
+    {
+        Settings s;
+        s.bars = 1; s.pattern = patFourFloor; s.sliceSteps = 4.0;   // only 4 slices for 6 samples
+        s.motifBars = 0; s.chaos = 0.3f;
+        std::array<int, 40> landedOn {};
+        int lastIndexCount = 0;
+        int changedAfterClick = 0, tried = 0;
+        for (juce::uint64 seed = 1; seed <= 40; ++seed)
+        {
+            Arrangement a; a.seed = seed;
+            auto hits = engine::buildHits (s, a.seed);
+            a.resizeFor (hits.size());
+            a.regenerate (seed);
+            auto before2 = engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+            if (before2->segments.empty())
+                continue;
+            const size_t last = before2->segments.size() - 1;
+            landedOn[(size_t) (seed - 1)] = before2->segments[last].slot;
+
+            // click the last slice: it has to change
+            const auto sgBefore = before2->segments[last];
+            a.reroll ((size_t) sgBefore.hitIndex, 12345);
+            auto after2 = engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+            ++tried;
+            if (after2->segments.size() == before2->segments.size())
+            {
+                const auto& sgAfter = after2->segments[last];
+                if (sgAfter.slot != sgBefore.slot || sgAfter.srcStart != sgBefore.srcStart)
+                    ++changedAfterClick;
+            }
+            // and re-rolling it again gives something else again
+            a.reroll ((size_t) sgBefore.hitIndex, 999);
+            auto third = engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+            if (third->segments.size() == before2->segments.size()
+                && third->segments[last].slot == after2->segments[last].slot
+                && third->segments[last].srcStart == after2->segments[last].srcStart)
+                ++lastIndexCount;
+        }
+        std::cout << "     clicking the last slice changed it in " << changedAfterClick << " of " << tried
+                  << " loops; clicking again gave the same slice " << lastIndexCount << " times\n";
+        CHECK (tried > 30 && changedAfterClick >= tried - 2, "clicking the last slice really changes it");
+        CHECK (lastIndexCount <= tried / 4, "and clicking it again gives something else again");
+    }
+
     // ------------------------------------------------------------------ 6b. every character knob does something
     {
-        auto renderWith = [&] (int pattern, double sliceSteps, std::function<void (Settings&)> tweak)
+        auto renderSeed = [&] (int pattern, double sliceSteps, juce::uint64 seed, std::function<void (Settings&)> tweak)
         {
             Settings s;
             s.bars = 2; s.pattern = pattern; s.sliceSteps = sliceSteps;
             s.motifBars = 1; s.variation = 0.0f; s.chaos = 0.0f;
             tweak (s);
-            Arrangement a; a.seed = 4242;
+            Arrangement a; a.seed = seed;
             auto hits = engine::buildHits (s, a.seed);
             a.resizeFor (hits.size());
-            a.regenerate (4242);
+            a.regenerate (seed);
             return engine::render (prepared, enabled, s, a, hits, hostBpm, hostRate);
+        };
+        auto renderWith = [&] (int pattern, double sliceSteps, std::function<void (Settings&)> tweak)
+        {
+            return renderSeed (pattern, sliceSteps, 4242, tweak);
         };
         auto sig = [] (const RenderResult& r)
         {
@@ -518,16 +570,27 @@ int main()
 
             for (const auto& k : knobs)
             {
-                auto changed = renderWith (setup.first, setup.second, k.on);
-                const bool moved = k.shows == inTheSoundOnly ? true
-                                 : k.shows == inThePositions ? starts (*changed) != plainStarts
-                                                             : sig (*changed) != plainSig;
-                bool audible = false;
-                if (changed->audio.getNumSamples() == plain->audio.getNumSamples())
-                    for (int i = 0; i < changed->audio.getNumSamples() && ! audible; i += 7)
-                        audible = std::abs (changed->audio.getSample (0, i) - plain->audio.getSample (0, i)) > 1.0e-4f;
-                else
-                    audible = true;
+                // over a few loops: with only a couple of free slices two different settings can
+                // land on the same spot by chance, and that is not the knob being broken
+                bool moved = false, audible = false;
+                static const juce::uint64 seeds[] = { 4242, 777, 31337 };
+                for (juce::uint64 sd : seeds)
+                {
+                    auto base2 = renderSeed (setup.first, setup.second, sd, [] (Settings&) {});
+                    auto changed = renderSeed (setup.first, setup.second, sd, k.on);
+                    moved |= k.shows == inTheSoundOnly ? true
+                           : k.shows == inThePositions ? starts (*changed) != starts (*base2)
+                                                       : sig (*changed) != sig (*base2);
+                    if (changed->audio.getNumSamples() == base2->audio.getNumSamples())
+                    {
+                        for (int i = 0; i < changed->audio.getNumSamples() && ! audible; i += 7)
+                            audible = std::abs (changed->audio.getSample (0, i) - base2->audio.getSample (0, i)) > 1.0e-4f;
+                    }
+                    else
+                        audible = true;
+                    if (moved && audible)
+                        break;
+                }
                 CHECK (moved && audible, juce::String (k.name) + " changes the loop (" + where + ")");
             }
         }

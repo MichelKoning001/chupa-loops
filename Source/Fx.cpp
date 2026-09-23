@@ -88,13 +88,15 @@ void FxChain::process (float* L, float* R, int n, const Params& p, double beatPo
             if (smoothLow > 0.001f) { l = hp1; r = hp2; }
         }
 
-        // ---- drive
+        // ---- drive: mixed in from nothing, so switching it on never jumps in level. The old
+        // shape started at 1.31x the moment it came on, which was an audible step of +2.4 dB.
         if (smoothDrive > 0.001f)
         {
             const float dg = 1.0f + smoothDrive * 9.0f;
             const float norm = 1.0f / std::tanh (dg);
-            l = std::tanh (l * dg) * norm;
-            r = std::tanh (r * dg) * norm;
+            const float a2 = juce::jlimit (0.0f, 1.0f, smoothDrive);
+            l = l + a2 * (std::tanh (l * dg) * norm - l);
+            r = r + a2 * (std::tanh (r * dg) * norm - r);
         }
 
         // ---- sidechain pump: ducks on every beat, recovers over the beat
@@ -117,6 +119,19 @@ void FxChain::process (float* L, float* R, int n, const Params& p, double beatPo
             l = m + sd;
             r = m - sd;
         }
+
+        // ---- a ceiling at the very end: resonance and drive can add a lot of level, and there
+        // is nothing after this. Below -1 dB nothing is touched, above it the peaks are rounded
+        // off instead of clipping square in your interface.
+        auto ceiling = [] (float x)
+        {
+            const float t = 0.89f;
+            if (x > t)  return t + (1.0f - t) * std::tanh ((x - t) / (1.0f - t));
+            if (x < -t) return -(t + (1.0f - t) * std::tanh ((-x - t) / (1.0f - t)));
+            return x;
+        };
+        l = ceiling (l);
+        r = ceiling (r);
 
         L[i] = l;
         if (R != nullptr) R[i] = r;

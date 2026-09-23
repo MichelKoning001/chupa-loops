@@ -105,6 +105,7 @@ public:
     using ParamMap = std::map<juce::String, float>;
     void generateNew (const ParamMap* settingsBefore = nullptr);
     void resetSettings();                    // every knob back to its default (CLEAR ALL)
+    void knobsToNeutral();                   // every knob back to its default, samples untouched
     void crazyLoop (int flavour);   // the skin's "craziest loop ever" (flavour = skin index)
     void mutate();                  // a variation: 20-30% of the unlocked slices change
     void rerollRhythm();            // new rhythm, same sources
@@ -146,13 +147,19 @@ public:
     double getPlayPosition() const noexcept { return playPosition.load(); }   // 0..1, <0 = stopped
     bool   isBusy() const noexcept          { return busy.load(); }
     double getHostBpm() const noexcept      { return hostBpm.load(); }
-    /** The tempo the loop runs at. MY TRACK leads: as long as a part of your own track is
-        loaded, its tempo is the loop's tempo. Without it the DAW's tempo is followed. */
+    /** The tempo the loop runs at. In a DAW that is the DAW's tempo - you are making a track at
+        that tempo and the loop has to run along with it. Without a DAW tempo (the standalone)
+        your own track leads: its tempo becomes the loop's tempo. Without either, the tempo you
+        set yourself. */
     double getLoopBpm() const noexcept
     {
+        if (hostProvidesTempo.load())
+            return juce::jlimit (40.0, 300.0, hostBpm.load());
         const double t = trackBpm.load();
         return juce::jlimit (40.0, 300.0, t >= 40.0 ? t : hostBpm.load());
     }
+    /** True while your own track sets the tempo (no DAW tempo to follow). */
+    bool trackLeadsTempo() const noexcept { return ! hostProvidesTempo.load() && trackBpm.load() >= 40.0; }
     bool   hasHostTempo() const noexcept    { return hostProvidesTempo.load(); }
     void   setFallbackBpm (double);
 
@@ -169,6 +176,8 @@ public:
 
     // editor size, remembered with the project
     std::atomic<int> editorWidth { 0 }, editorTab { 0 };
+    /** NEW LOOP also puts every knob back to neutral (your choice, kept with the project). */
+    std::atomic<bool> newLoopNeutral { false };
     static juce::File getDefaultExportFolder();
 
     Settings readSettings() const;
@@ -273,6 +282,7 @@ private:
     std::atomic<int> keyBeforeReference { -1 };
     void updateFitFromSlots();
     void updateTrackBpm();                 // MY TRACK leads: its tempo becomes the loop's tempo
+    void rearmTrackPreview();              // your track is playing and its bars moved: line it up again
     void applyReferenceKey (int slot);
     // background jobs on the worker thread (they need the prepared samples)
     std::atomic<int> autoPickRequest { 0 }, jobVersion { 0 };
@@ -286,6 +296,8 @@ private:
     void runStems (const std::array<bool, kAllSlots>& enabled, const Settings& rs, double bpm, double rate);
     std::atomic<double> hostBpm { defaultBpm }, fallbackBpm { defaultBpm }, currentRate { 0.0 }, playPosition { -1.0 };
     std::atomic<double> trackBpm { 0.0 };    // MY TRACK's tempo, 0 when no track is loaded
+    std::atomic<double> lastHostTempo { 0.0 };   // the last tempo the DAW gave: a host that only
+    std::atomic<bool> everHadHostTempo { false }; // reports it while playing must not flip us over
     std::atomic<bool> standaloneStateRestored { false };   // the standalone reloads its last session once
     std::atomic<bool> editorEverOpened { false };          // ... and it does that before the window exists
     std::atomic<bool> keyRestoreWanted { false }, trackRegrid { false }, warpPreviewRearm { false };
@@ -340,15 +352,23 @@ private:
     std::array<int, 64> fxSliceStarts {};
 
     // listening to a single slot (its own tempo, looping): published by the message thread
-    void mixSlotPreview (juce::AudioBuffer<float>&, double rate);
+    void mixSlotPreview (juce::AudioBuffer<float>&, double rate, bool restart);
     mutable juce::SpinLock slotPreviewLock;
     std::shared_ptr<const juce::AudioBuffer<float>> slotPreviewAudio;   // guarded by slotPreviewLock
     std::atomic<double> slotPreviewRate { 44100.0 };
     std::atomic<float> slotPreviewTrimStart { 0.0f }, slotPreviewTrimEnd { 1.0f };
+    // your own track plays along with the loop: a whole number of bars, from its own bar one
+    std::atomic<int> slotPreviewLoopA { -1 }, slotPreviewLoopB { -1 };
+    std::atomic<double> slotPreviewTempo { 0.0 };   // the played sample's own tempo (0 = play as it is)
+    /** Goes up every time listening has to start on the one again. The audio thread reads it once
+        per block, so your own track and the loop always start in the very same block. */
+    std::atomic<int> previewStartVersion { 0 };
+    int seenPreviewStart = -1;                      // audio thread
     std::deque<std::shared_ptr<const juce::AudioBuffer<float>>> slotPreviewKeep;   // message thread: keeps old audio alive
     std::atomic<int> slotPreviewIndex { -1 }, slotPreviewVersion { 0 };
     std::shared_ptr<const juce::AudioBuffer<float>> slotPlaying;        // audio thread
     double slotPlayPos = 0.0, slotPlayStep = 1.0;
+    double trackFollowPos = -1.0;   // audio thread: where the DAW says your own track should be
     float slotPlayGain = 0.0f;
     int slotPlayVersion = -1;
 

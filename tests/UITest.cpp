@@ -11,11 +11,12 @@ using namespace slicetribe;
 struct FakeHost : juce::AudioPlayHead
 {
     double ppq = 0.0, bpm = 140.0;
-    bool playing = false;
+    bool playing = false, provideBpm = true;   // a host that gives no tempo at all does happen
     juce::Optional<PositionInfo> getPosition() const override
     {
         PositionInfo p;
-        p.setBpm (bpm);
+        if (provideBpm)
+            p.setBpm (bpm);
         p.setPpqPosition (ppq);
         p.setIsPlaying (playing);
         p.setTimeInSeconds (bpm > 0.0 ? ppq * 60.0 / bpm : 0.0);
@@ -636,22 +637,13 @@ int main (int argc, char** argv)
                 for (const auto& sg : withFit->segments) fromRef += sg.slot == kTrackSlot ? 1 : 0;
                 CHECK (fromRef == 0, "no slices are taken from your own track");
 
-                // MY TRACK leads, like Splice: its tempo is the loop's tempo, not the DAW's
+                // In a DAW the DAW decides the tempo, also with your own track loaded: you are
+                // making a track at that tempo and the loop has to run along with it.
                 std::cout << "     DAW " << proc->getHostBpm() << " bpm, your track 140 bpm -> loop "
                           << proc->getLoopBpm() << " bpm\n";
-                CHECK (std::abs (proc->getHostBpm() - 140.0) > 1.0 && std::abs (proc->getLoopBpm() - 140.0) < 0.5,
-                       "your own track's tempo becomes the loop's tempo, not the DAW's");
-                CHECK (std::abs (withFit->bpm - 140.0) < 0.5, "and the loop is really rendered at that tempo");
-                {
-                    const int vb = proc->getResultVersion();
-                    proc->setSlotBpm (kTrackSlot, 128.0);
-                    CHECK (waitFor (*proc, vb + 1, 30000) && std::abs (proc->getDisplayResult()->bpm - 128.0) < 0.5,
-                           "move your track's tempo and the loop moves with it");
-                    const int vb2 = proc->getResultVersion();
-                    proc->setSlotBpm (kTrackSlot, 0.0);
-                    waitFor (*proc, vb2 + 1, 30000);
-                    CHECK (std::abs (proc->getLoopBpm() - 140.0) < 0.5, "back to automatic: the track's own tempo again");
-                }
+                CHECK (std::abs (proc->getLoopBpm() - proc->getHostBpm()) < 0.01 && ! proc->trackLeadsTempo(),
+                       "in a DAW the loop runs at the DAW's tempo, also with your own track loaded");
+                CHECK (std::abs (withFit->bpm - proc->getHostBpm()) < 0.5, "and the loop is really rendered at that tempo");
 
                 auto onBeatShare = [] (const RenderResult& r)
                 {
@@ -745,16 +737,35 @@ int main (int argc, char** argv)
                                 }
                     return pairs > 0 ? (double) same / pairs : 0.0;
                 };
+                // measured with two samples only: with more samples than slices in one repeat, a
+                // few slices are handed to a sample that would otherwise never be heard, and those
+                // are not part of the repeat - that would measure the hand-over, not the motif.
+                // and with VARIATION at 0: variation is meant to change slices in a repeat, so
+                // leaving it on would measure that instead of the motif.
+                for (int i2 = 2; i2 < kNumSlots; ++i2)
+                    proc->setSlotEnabled (i2, false);
+                const float varWas = proc->apvts.getParameter ("variation")->getValue();
+                setParam ("variation", 0.0f);
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
                 const double before3 = motifRepeats (*proc->getDisplayResult());
                 proc->rerollSources();
                 waitFor (*proc, proc->getResultVersion() + 1);
                 const double after3 = motifRepeats (*proc->getDisplayResult());
+                for (int i2 = 2; i2 < kNumSlots; ++i2)
+                    proc->setSlotEnabled (i2, true);
+                proc->apvts.getParameter ("variation")->setValueNotifyingHost (varWas);
+                waitFor (*proc, proc->getResultVersion() + 1, 30000);
                 std::cout << "     motif repeats: " << juce::String (before3 * 100, 0) << "% before SRC, "
                           << juce::String (after3 * 100, 0) << "% after\n";
                 // with more samples loaded than there are slices in one repeat, a couple of slices
                 // carry a sample that would otherwise never be heard, so the repeat is not 100%.
                 // What matters here is that SRC does not make it any worse.
-                CHECK (before3 > 0.7 && after3 >= before3 - 0.01, "SRC keeps the motif repeat");
+                // With more samples loaded than there are slices in one repeat, a couple of slices
+                // are handed to a sample that would otherwise never be heard, and those are not
+                // part of the repeat - at most a third of the loop, so the repeat can never fall
+                // below about 70%. What this watches for is SRC pulling the motif apart.
+                CHECK (before3 > 0.99 && after3 > 0.99, "SRC keeps the motif repeat");
                 setParam ("motif", 2); setParam ("variation", 20);
                 waitFor (*proc, proc->getResultVersion() + 1);
             }
@@ -1014,6 +1025,15 @@ int main (int argc, char** argv)
             waitFor (*proc, proc->getResultVersion() + 1);
         }
 
+        // wait until the engine has really settled, so the loop under test cannot be replaced
+        // half way through the MIDI checks below
+        for (int t = 0; t < 200; ++t)
+        {
+            const int v = proc->getResultVersion();
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+            if (! proc->isBusy() && proc->getResultVersion() == v)
+                break;
+        }
         r = proc->getDisplayResult();
         const float peakLoop = r->audio.getMagnitude (0, r->audio.getNumSamples());
 
@@ -1022,14 +1042,29 @@ int main (int argc, char** argv)
             setParam ("midiMode", 1);
             block ({});   // mode switch
             CHECK (block ({}).getMagnitude (0, 512) < 1.0e-6f, "Slices mode: silent without notes");
-            const auto& seg = r->segments[(size_t) r->noteSegment[3]];   // the 4th different slice
-            const int sn = juce::jlimit (512, 8192, (int) seg.length - 400);
-            auto first = block (note (37 + 3, true), sn);
-            double maxErr = 0.0;
-            for (int i = 200; i < sn; ++i)
-                maxErr = juce::jmax (maxErr, (double) std::abs (first.getSample (0, i) - r->audio.getSample (0, (int) seg.start + i)));
-            std::cout << "     slice 4 on E1: max deviation " << maxErr << ", level " << first.getMagnitude (0, sn) << ", slice length " << seg.length << "\n";
-            CHECK (first.getMagnitude (0, sn) > 0.01f && maxErr < 2.0e-3, "Slices mode: E1 (note 40) plays the 4th different slice exactly");
+            // the engine may publish a new loop at any moment; compare against the loop that was
+            // really playing, and try again if it was replaced half way through
+            double maxErr = 1.0, level = 0.0;
+            juce::int64 segLen = 0;
+            for (int attempt = 0; attempt < 5; ++attempt)
+            {
+                const int v0 = proc->getResultVersion();
+                auto cur = proc->getDisplayResult();
+                const auto& seg = cur->segments[(size_t) cur->noteSegment[3]];   // the 4th different slice
+                const int sn = juce::jlimit (512, 8192, (int) seg.length - 400);
+                auto first = block (note (37 + 3, true), sn);
+                block (note (37 + 3, false), 256);
+                if (proc->getResultVersion() != v0)
+                    continue;                                  // a new loop landed: this reading is void
+                maxErr = 0.0;
+                for (int i = 200; i < sn; ++i)
+                    maxErr = juce::jmax (maxErr, (double) std::abs (first.getSample (0, i) - cur->audio.getSample (0, (int) seg.start + i)));
+                level = first.getMagnitude (0, sn);
+                segLen = seg.length;
+                break;
+            }
+            std::cout << "     slice 4 on E1: max deviation " << maxErr << ", level " << level << ", slice length " << segLen << "\n";
+            CHECK (level > 0.01f && maxErr < 2.0e-3, "Slices mode: E1 (note 40) plays the 4th different slice exactly");
             block (note (40, false));
             float tail = 0.0f;
             for (int k = 0; k < 4; ++k) tail = block ({}).getMagnitude (0, 512);
@@ -1589,6 +1624,150 @@ int main (int argc, char** argv)
         CHECK (std::abs (p13->getHostBpm() - 174.0) < 0.01, "the tempo you set without a DAW comes back with the project");
     }
 
+    // ---- MY TRACK and the loop play together, on the beat, and stay together ----------------
+    {
+        const double rate = 48000.0, tBpm = 140.0;
+        const double barLen = rate * 240.0 / tBpm;
+        const int head = (int) (barLen * 0.5);              // half a bar of silence before bar one
+        const int total = head + (int) (barLen * 8);
+        juce::AudioBuffer<float> track (2, total);
+        track.clear();
+        for (int beat = 0; beat < 32; ++beat)               // a kick on every beat, from bar one
+        {
+            const int pos = head + (int) (beat * barLen / 4.0);
+            for (int i = 0; i < (int) (rate * 0.1) && pos + i < total; ++i)
+            {
+                const double t = i / rate;
+                const float v = (float) (std::sin (juce::MathConstants<double>::twoPi * 55.0 * t)
+                                         * std::exp (-t * 12.0) * 0.8);
+                track.setSample (0, pos + i, v);
+                track.setSample (1, pos + i, v);
+            }
+        }
+        auto trackFile = out.getChildFile ("MyTrack_sync_140bpm_Am.wav");
+        engine::writeWav (trackFile, track, rate, 1.0f);
+
+        const int found = engine::findDownbeat (track, rate, tBpm);
+        std::cout << "     bar one of the track found at " << found << " (really " << head << ")\n";
+        CHECK (found >= 0 && std::abs (found - head) < (int) (barLen / 16.0), "bar one of your own track is found");
+
+        // Two situations, both have to work: on its own (no DAW tempo - your track leads) and in
+        // a DAW on another tempo (the DAW leads and your track is played at that tempo).
+        for (int situation = 0; situation < 2; ++situation)
+        {
+            const bool inDaw = situation == 1;
+            const juce::String where = inDaw ? "in a DAW at 125" : "on its own";
+            auto ps = std::make_unique<SliceTribeProcessor>();
+            FakeHost fh;
+            fh.bpm = 125.0;
+            fh.provideBpm = inDaw;
+            ps->setPlayHead (&fh);
+            ps->prepareToPlay (rate, 512);
+            ps->loadSlot (0, files[0]);
+            ps->loadSlot (kTrackSlot, trackFile);
+            for (int t = 0; t < 200 && ! ps->getSlotInfo (kTrackSlot).loaded; ++t)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+            CHECK (waitFor (*ps, 1, 30000), juce::String ("a loop next to your own track (") + where + ")");
+
+            // let the plug-in see the play head first: that is where it learns the DAW's tempo
+            {
+                juce::AudioBuffer<float> warm;
+                runHost (*ps, fh, 0.05, &warm);
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+                const double target = inDaw ? 125.0 : tBpm;
+                for (int t = 0; t < 200 && std::abs (ps->getDisplayResult()->bpm - target) > 0.5; ++t)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+            }
+            const double want = inDaw ? 125.0 : tBpm;
+            const juce::String tempoMsg = inDaw ? "in a DAW the loop runs at the DAW's tempo"
+                                                : "without a DAW your own track sets the tempo";
+            CHECK (std::abs (ps->getLoopBpm() - want) < 0.5, tempoMsg);
+
+            // press play on the track box
+            ps->setSlotPreview (kTrackSlot);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
+            CHECK (ps->getSlotPreview() == kTrackSlot && ps->isPreviewing(),
+                   juce::String ("playing your own track does not stop the loop: they play together (") + where + ")");
+
+            juce::AudioBuffer<float> cap;
+            runHost (*ps, fh, 0.05, &cap);                  // a few blocks: both are under way
+            const double trackStart = ps->getSlotPreviewPosition();
+            const double loopStart = ps->getPlayPosition();
+            std::cout << "     " << where << " - start: track at " << juce::String (trackStart, 4)
+                      << " of the file (bar one = " << juce::String ((double) head / total, 4)
+                      << "), loop at " << juce::String (loopStart, 4) << "\n";
+            CHECK (std::abs (trackStart - (double) head / total) < 0.02,
+                   juce::String ("your track starts on its own beat one (") + where + ")");
+            CHECK (loopStart >= 0.0 && loopStart < 0.05,
+                   juce::String ("and the loop starts on its one at the same moment (") + where + ")");
+
+            // let exactly eight bars go by, at the tempo the loop runs at: both back on the one
+            runHost (*ps, fh, 8 * 4 * 60.0 / ps->getLoopBpm() - 0.05, nullptr);
+            const double trackAfter = ps->getSlotPreviewPosition();
+            const double loopAfter = ps->getPlayPosition();
+            // how far into its own bar the track is, 0 = exactly on the one (its loop runs from
+            // bar one to the end of the file, so that is the stretch to measure in)
+            const double regA = (double) head / total, regB = 1.0;
+            double phase = std::fmod ((trackAfter - regA) / (regB - regA) + 1.0, 1.0) * 8.0;   // in bars
+            if (phase > 7.5) phase -= 8.0;
+            std::cout << "     " << where << " - after 8 bars: track at " << juce::String (trackAfter, 4)
+                      << " (" << juce::String (phase, 3) << " bars off the one), loop at "
+                      << juce::String (loopAfter, 4) << "\n";
+            CHECK (std::abs (phase) < 0.05,
+                   juce::String ("after eight bars your track is back on its one (") + where + ")");
+            CHECK (loopAfter < 0.03 || loopAfter > 0.97,
+                   juce::String ("and the loop is back on its one too: they stay together (") + where + ")");
+
+            // and they still run together after minutes, not just after eight bars. What counts
+            // is where each of them is inside its bar: that has to stay the same, for ever.
+            if (! inDaw)
+            {
+                const int loopBars = ps->getDisplayResult()->settings.bars;
+                auto barPhase = [&] ()
+                {
+                    const double t = std::fmod ((ps->getSlotPreviewPosition() - regA) / (regB - regA) * 8.0 + 8.0, 1.0);
+                    const double l = std::fmod (ps->getPlayPosition() * loopBars + (double) loopBars, 1.0);
+                    double d = t - l;
+                    if (d > 0.5) d -= 1.0;
+                    if (d < -0.5) d += 1.0;
+                    return d;
+                };
+                const double d0 = barPhase();
+                runHost (*ps, fh, 180.0, nullptr);
+                const double d1 = barPhase();
+                std::cout << "     inside the bar: " << juce::String (d0 * 1000.0, 1)
+                          << " -> " << juce::String (d1 * 1000.0, 1) << " thousandths of a bar apart"
+                          << " after three minutes\n";
+                CHECK (std::abs (d1) < 0.01 && std::abs (d1 - d0) < 0.01,
+                       "after three minutes they are still exactly together");
+            }
+
+            // one button: they started together, so they stop together too
+            ps->setSlotPreview (kTrackSlot);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
+            CHECK (ps->getSlotPreview() < 0 && ! ps->isPreviewing(),
+                   juce::String ("clicking again stops your track and the loop together (") + where + ")");
+
+            // correcting the track's tempo while it plays must not throw it out of time
+            ps->setSlotPreview (kTrackSlot);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
+            runHost (*ps, fh, 0.2, nullptr);
+            ps->setSlotBpm (kTrackSlot, tBpm);          // say out loud what it already is
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
+            runHost (*ps, fh, 8 * 4 * 60.0 / ps->getLoopBpm(), nullptr);
+            double ph2 = std::fmod ((ps->getSlotPreviewPosition() - regA) / (regB - regA) + 1.0, 1.0) * 8.0;
+            if (ph2 > 7.5) ph2 -= 8.0;
+            std::cout << "     " << where << " - after correcting the tempo: "
+                      << juce::String (ph2, 3) << " bars off the one\n";
+            CHECK (std::abs (ph2) < 0.05,
+                   juce::String ("correcting your track's tempo keeps it in time (") + where + ")");
+            ps->setSlotPreview (kTrackSlot);
+
+            ps->setPlayHead (nullptr);
+            ps->releaseResources();
+        }
+    }
+
     // ---- the FX section, and everything that only does its work inside the plug-in ----------
     {
         auto pf = std::make_unique<SliceTribeProcessor>();
@@ -1648,6 +1827,36 @@ int main (int argc, char** argv)
             set (f.id, f.def);
             set ("fxEnv", 0.0f);
             set ("fxCutoff", 100.0f);
+        }
+
+        // nothing may come out of the FX section above full scale, however hard you drive it
+        {
+            set ("fxCutoff", 45.0f); set ("fxReso", 100.0f); set ("fxDrive", 100.0f);
+            set ("gain", 12.0f);
+            juce::AudioBuffer<float> hot;
+            play (hot);
+            float peak = 0.0f;
+            for (int c = 0; c < hot.getNumChannels(); ++c)
+                peak = juce::jmax (peak, hot.getMagnitude (c, 0, hot.getNumSamples()));
+            std::cout << "     everything driven to the max: peak " << juce::String (peak, 3) << "\n";
+            CHECK (peak <= 1.02f, "resonance + drive + volume all the way up still does not go over full scale");
+            set ("fxCutoff", 100.0f); set ("fxReso", 0.0f); set ("fxDrive", 0.0f); set ("gain", 0.0f);
+        }
+
+        // switching Drive on must not jump in level
+        {
+            juce::AudioBuffer<float> off2, tiny;
+            set ("fxDrive", 0.0f);
+            play (off2);
+            set ("fxDrive", 0.5f);            // just barely on
+            play (tiny);
+            double worst = 0.0;
+            const int n2 = juce::jmin (off2.getNumSamples(), tiny.getNumSamples());
+            for (int i = 12000; i < n2; i += 3)
+                worst = juce::jmax (worst, (double) std::abs (tiny.getSample (0, i) - off2.getSample (0, i)));
+            std::cout << "     Drive just on: biggest difference " << juce::String (worst, 4) << "\n";
+            CHECK (worst < 0.02, "turning Drive just on does not jump in level");
+            set ("fxDrive", 0.0f);
         }
 
         // WIDTH and KEY need material that has something to work on: a real stereo sample with

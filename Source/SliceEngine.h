@@ -84,7 +84,7 @@ struct Settings
     bool structureEquals (const Settings& o) const
     {
         return bars == o.bars && pattern == o.pattern && sliceSteps == o.sliceSteps
-            && motifBars == o.motifBars;
+            && motifBars == o.motifBars && fillBars == o.fillBars;   // a fill adds slices in the middle
     }
 };
 
@@ -132,6 +132,7 @@ struct SlotAudio
     int detectedKey = -1;         // root*2 + minor (0..23), -1 = unknown
     std::vector<float> peaks;     // min/max pairs for the UI thumbnail
     std::array<float, 16> gridProfile {};   // how busy every 1/16 of a bar is (0..1), for FIT TO TRACK
+    int downbeat = -1;            // where bar one of this recording starts, in samples (-1 = unknown)
     int loadId = 0;               // changes every time a new file is loaded
 };
 

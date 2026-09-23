@@ -145,7 +145,12 @@ MainView::MainView (SliceTribeProcessor& p)
 
     generateButton.setTooltip (juce::String (proc.isStandalone() ? "Make a new loop (N). Locked slices stay." : "Make a new loop. Locked slices stay.")
                                + "\nMIDI note C1 does the same (MIDI NOTES on Control). Right-click = MIDI learn.");
-    generateButton.onClick = [this] { proc.generateNew(); };
+    generateButton.onClick = [this]
+    {
+        if (proc.newLoopNeutral.load())
+            proc.knobsToNeutral();
+        proc.generateNew();
+    };
     addAndMakeVisible (generateButton);
 
     crazyButton.onClick = [this]
@@ -154,6 +159,16 @@ MainView::MainView (SliceTribeProcessor& p)
         flash (skin().crazyName + "!  Load your preset again to calm down.", colours::cyan());
     };
     addAndMakeVisible (crazyButton);
+
+    // your choice: does NEW LOOP leave the panel as you set it, or start clean every time
+    neutralButton.setClickingTogglesState (false);
+    neutralButton.onClick = [this]
+    {
+        proc.newLoopNeutral = ! proc.newLoopNeutral.load();
+        refreshNeutralButton();
+    };
+    addAndMakeVisible (neutralButton);
+    refreshNeutralButton();
 
     mutateButton.setButtonText ("MUTATE");
     mutateButton.setTooltip ("A variation of this loop: about a quarter of the unlocked slices change, the rest stays.\nMIDI note F1 does the same (MIDI NOTES on Control).");
@@ -556,16 +571,17 @@ void MainView::resized()
         fxKnobs[i]->setBounds (kx + (i % 5) * kw, ky + (i / 5) * (kh + 6), kw, kh);
 
     // actions
-    generateButton.setBounds (936, 530, 156, 48);
-    mutateButton.setBounds   (936, 584, 76, 28);
-    rhythmButton.setBounds   (1016, 584, 36, 28);
-    sourcesButton.setBounds  (1056, 584, 36, 28);
-    crazyButton.setBounds    (936, 618, 156, 30);
-    backButton.setBounds     (936, 654, 38, 26);
-    historyLabel.setBounds   (976, 654, 76, 26);
-    forwardButton.setBounds  (1054, 654, 38, 26);
-    unlockButton.setBounds   (936, 686, 156, 26);
-    exportButton.setBounds   (936, 718, 156, 26);
+    generateButton.setBounds (936, 530, 156, 44);
+    mutateButton.setBounds   (936, 578, 76, 26);
+    rhythmButton.setBounds   (1016, 578, 36, 26);
+    sourcesButton.setBounds  (1056, 578, 36, 26);
+    neutralButton.setBounds  (936, 608, 156, 22);
+    crazyButton.setBounds    (936, 634, 156, 28);
+    backButton.setBounds     (936, 666, 38, 24);
+    historyLabel.setBounds   (976, 666, 76, 24);
+    forwardButton.setBounds  (1054, 666, 38, 24);
+    unlockButton.setBounds   (936, 694, 156, 24);
+    exportButton.setBounds   (936, 722, 156, 24);
     dragOut.setBounds        (936, 750, 76, 26);
     dragMidi.setBounds       (1016, 750, 76, 26);
 
@@ -628,6 +644,16 @@ void MainView::showParamMenu (juce::Component& target, const juce::String& param
             safe->proc.clearMidiMapping (paramId);
         safe->repaint();
     });
+}
+
+void MainView::refreshNeutralButton()
+{
+    const bool on = proc.newLoopNeutral.load();
+    neutralButton.setButtonText (on ? "NEW LOOP: ALL NEUTRAL" : "NEW LOOP: KEEP KNOBS");
+    neutralButton.setTooltip (on ? "NEW LOOP also puts every knob back to neutral first, so you start clean every time.\nClick to keep your settings instead."
+                                 : "NEW LOOP leaves the panel exactly as you set it.\nClick to have it start from neutral every time.");
+    neutralButton.setColour (juce::TextButton::textColourOffId, on ? colours::cyan() : colours::dim());
+    neutralButton.repaint();
 }
 
 juce::String MainView::midiTagFor (const juce::String& paramId)
@@ -876,7 +902,7 @@ void MainView::updateState()
     forwardButton.setEnabled (proc.getHistoryPosition() < proc.getHistorySize() - 1);
 
     // the tempo the loop really runs at: your own track's when one is loaded, otherwise the DAW's
-    const bool trackLeads = proc.getLoopBpm() != proc.getHostBpm() || proc.getSlotInfo (kTrackSlot).loaded;
+    const bool trackLeads = proc.trackLeadsTempo();
     const bool tempoLocked = proc.hasHostTempo() || trackLeads;
     tempoField.setValue (proc.getLoopBpm());
     const juce::String tempoTag = trackLeads ? "TRACK" : "SYNC";

@@ -91,6 +91,8 @@ private:
 
     GenerateButton generateButton;
     CrazyButton crazyButton;
+    juce::TextButton neutralButton;
+    void refreshNeutralButton();
     juce::TextButton mutateButton, rhythmButton, sourcesButton, autoPickButton, keepButton, backButton, forwardButton, exportButton, previewButton, unlockButton, spliceButton,
                      presetPrev, presetNext, presetSave, skinButton, aboutButton, clearAllButton;
     PresetNameBox presetName;

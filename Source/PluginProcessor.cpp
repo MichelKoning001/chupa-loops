@@ -389,30 +389,32 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                 timeSecs = *t;
         }
     }
+    // A host that only reports its tempo while the transport runs must not hand the tempo over
+    // to your own track the moment you press stop: the last tempo it gave stays the DAW's tempo.
+    if (tempoFromHost)
+    {
+        lastHostTempo = bpm;
+        everHadHostTempo = true;
+    }
+    else if (everHadHostTempo.load() && lastHostTempo.load() >= 20.0)
+    {
+        bpm = lastHostTempo.load();
+        tempoFromHost = true;
+    }
     hostProvidesTempo = tempoFromHost;
     if (std::abs (bpm - hostBpm.load()) > 1.0e-3)
     {
         hostBpm = bpm;
-        if (trackBpm.load() < 40.0)
-            upToDate = false;   // without your own track the loop follows the DAW
+        if (! trackLeadsTempo())
+            upToDate = false;   // the loop follows the DAW
     }
 
-    // MY TRACK leads. With a part of your own track loaded, the loop runs at that track's tempo
-    // instead of the DAW's, and beat one of the loop falls on beat one of the project - so the
-    // two run side by side, both starting on the 1. Move the track's tempo and the loop moves
-    // with it. Without a track nothing changes: the DAW's tempo and the DAW's grid.
-    const double hostTempo = juce::jlimit (40.0, 300.0, bpm);
-    const bool trackLeads = trackBpm.load() >= 40.0;
+    // The tempo the loop runs at: the DAW's when there is one (you are making a track at that
+    // tempo), otherwise your own track's. The position stays the host's own beat count - ppq is
+    // already in quarter notes, so it needs no tempo to be converted with and it survives a
+    // tempo change or a tempo ramp in the project.
     bpm = getLoopBpm();
-    if (trackLeads)
-    {
-        // Count in the project's own time, not in its beats: with a tempo change or a tempo ramp
-        // in the project the loop would otherwise jump. Second 0 of the project is the one.
-        if (timeSecs.has_value())
-            ppq = *timeSecs * bpm / 60.0;
-        else if (ppq.has_value() && hostTempo > 1.0e-6)
-            ppq = *ppq * (bpm / hostTempo);
-    }
+    juce::ignoreUnused (timeSecs);
 
     // Offline bounce/export: the host does not need real time, so wait for the engine to finish
     // (time-stretching after a load or tempo change) instead of rendering silence.
@@ -420,6 +422,15 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         preview = false;   // the DAW took over: preview ends
     if (! hostPlaying)
         offlineWaited = false;
+    // your own track and the loop start on the one in the very same block
+    bool startPreviewNow = false;
+    if (const int pv = previewStartVersion.load(); pv != seenPreviewStart)
+    {
+        seenPreviewStart = pv;
+        startPreviewNow = true;
+        previewIndex = 0.0;
+    }
+
     const int keyNow = (int) apvts.getRawParameterValue ("key")->load() - 1;
     auto ready = [&]
     {
@@ -455,8 +466,6 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         crossfadeLeft = 0;
     }
 
-    if (previewRestart.exchange (false))
-        previewIndex = 0.0;
 
     // ---- pick up a freshly rendered loop --------------------------------------
     {
@@ -478,16 +487,38 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
     }
 
-    if (hostPlaying && slotPreviewIndex.load() >= 0)
+    // The DAW plays: listening to a single sample stops - except your own track. That one is
+    // meant to run under the loop so you can hear whether it fits, in the DAW just as much as on
+    // its own. It is hung on the DAW's own bar count, so it always starts on the one.
+    if (hostPlaying && slotPreviewIndex.load() >= 0 && slotPreviewIndex.load() != kTrackSlot)
     {
-        slotPreviewIndex = -1;   // the DAW plays: stop listening to a single sample
+        slotPreviewIndex = -1;
         slotPreviewVersion.fetch_add (1);
     }
+    if (hostPlaying && ppq.has_value() && slotPreviewIndex.load() == kTrackSlot)
+    {
+        const int a2 = slotPreviewLoopA.load(), b2 = slotPreviewLoopB.load();
+        const double own = slotPreviewTempo.load();
+        if (a2 >= 0 && b2 > a2 + 1 && own >= 40.0)
+        {
+            // where in your track's own bars the project is right now
+            const double barsIn = *ppq / 4.0;
+            const double lenBars = (b2 - a2) / (currentRate.load() > 0.0 ? slotPreviewRate.load() * 240.0 / own : 1.0);
+            if (lenBars > 0.01)
+            {
+                double phase = std::fmod (barsIn, lenBars);
+                if (phase < 0.0) phase += lenBars;
+                trackFollowPos = (double) a2 + phase / lenBars * (double) (b2 - a2);
+            }
+        }
+    }
+    else
+        trackFollowPos = -1.0;
 
     if (playing == nullptr || playing->audio.getNumSamples() < 2)
     {
         playPosition = -1.0;
-        mixSlotPreview (buffer, rate);
+        mixSlotPreview (buffer, rate, startPreviewNow);
         return;
     }
 
@@ -507,7 +538,7 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     {
         // Slices / Keys: the loop is played from MIDI notes instead of the transport
         renderInstrument (buffer, res, mode, bpm, rate, hostPlaying, ppq);
-        mixSlotPreview (buffer, rate);
+        mixSlotPreview (buffer, rate, startPreviewNow);
         return;
     }
 
@@ -550,7 +581,7 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         playPosition = -1.0;
         fadingOut.reset();
         crossfadeLeft = 0;
-        mixSlotPreview (buffer, rate);   // listening to a single sample still works with the transport stopped
+        mixSlotPreview (buffer, rate, startPreviewNow);   // listening to a single sample still works with the transport stopped
         return;
     }
 
@@ -600,7 +631,7 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         previewIndex = playIndex;
 
     applyFx (buffer, res, blockStartIndex, step, numSamples);
-    mixSlotPreview (buffer, rate);
+    mixSlotPreview (buffer, rate, startPreviewNow);
     playPosition = playIndex / len;
 }
 
@@ -967,8 +998,8 @@ void SliceTribeProcessor::run()
                 if (i == kTrackSlot)   // for FIT TO TRACK, measured from your track's own bar one
                 {
                     const double gb = job.state.bpmOverride > 0.0 ? job.state.bpmOverride : a.detectedBpm;
-                    a.gridProfile = engine::gridProfile (*a.original, a.fileRate, gb,
-                                                         engine::findDownbeat (*a.original, a.fileRate, gb));
+                    a.downbeat = engine::findDownbeat (*a.original, a.fileRate, gb);
+                    a.gridProfile = engine::gridProfile (*a.original, a.fileRate, gb, a.downbeat);
                 }
                 if (fromEmbedded)
                     emb = job.embedded;
@@ -1175,7 +1206,10 @@ void SliceTribeProcessor::run()
             continue;
         }
         const int version = updateVersion.load();
-        if (changed || version != lastVersion || ! haveLast || ! settingsEqual (s, lastSettings) || bpm != lastBpm || rate != lastRate)
+        // a moving tempo (a ramp in the project) must not make a whole new loop on every pass:
+        // wait until the tempo stands still, exactly like the stretching does
+        const bool tempoMoved = bpm != lastBpm && (bpmStable || ! haveLast);
+        if (changed || version != lastVersion || ! haveLast || ! settingsEqual (s, lastSettings) || tempoMoved || rate != lastRate)
         {
             busy = true;
             Settings rs = s;
@@ -1323,7 +1357,10 @@ void SliceTribeProcessor::runStems (const std::array<bool, kAllSlots>& enabled, 
         arr = arrangement;
     }
     const auto hits = engine::buildHits (rs, arr.seed);
-    const float gain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f);
+    // your own track is a reference under the loop, so it leaves room for it instead of adding
+    // a second full-scale signal on top (that would clip before you can judge anything)
+    const float ref = slotPreviewIndex.load() == kTrackSlot ? 0.6f : 1.0f;
+    const float gain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f) * ref;
     juce::String names;
     int written = 0;
     for (int i = 0; i < kNumSlots && ! abortWork.load() && ! threadShouldExit(); ++i)
@@ -1542,11 +1579,13 @@ void SliceTribeProcessor::loadSlot (int slot, const juce::File& f)
 
 void SliceTribeProcessor::setSlotPreview (int slot)
 {
+    const bool wasTrack = slotPreviewIndex.load() == kTrackSlot;
     if (slot == slotPreviewIndex.load())
         slot = -1;                                  // clicking the playing slot again stops it
     std::shared_ptr<const juce::AudioBuffer<float>> audio;
-    double fileRate = 44100.0;
+    double fileRate = 44100.0, trackTempo = 0.0;
     float trimA = 0.0f, trimB = 1.0f;
+    int downbeat = -1;
     if (juce::isPositiveAndBelow (slot, kAllSlots))
     {
         const juce::ScopedLock sl (slotLock);
@@ -1555,11 +1594,62 @@ void SliceTribeProcessor::setSlotPreview (int slot)
         fileRate = slotAudio[(size_t) slot].fileRate;
         trimA = slotState[(size_t) slot].trimStart;
         trimB = slotState[(size_t) slot].trimEnd;
+        downbeat = slotAudio[(size_t) slot].downbeat;
+        trackTempo = slotState[(size_t) slot].bpmOverride > 0.0 ? slotState[(size_t) slot].bpmOverride
+                                                                : slotAudio[(size_t) slot].detectedBpm;
         if (audio == nullptr || audio->getNumSamples() < 2)
             slot = -1;
     }
     else
         slot = -1;
+
+    // Your own track plays along with the loop, so it has to run in bars: it starts on its own
+    // bar one and loops over a whole number of bars. Without that it drifts out of time after
+    // one pass, however well the loop itself is lined up.
+    int loopA = -1, loopB = -1;
+    if (slot == kTrackSlot && audio != nullptr && trackTempo >= 40.0 && trackTempo <= 300.0)
+    {
+        const int n = audio->getNumSamples();
+        const double barLen = fileRate * 240.0 / trackTempo;
+        const int from = juce::jlimit (0, n - 2, (int) (trimA * n));
+        const int to   = juce::jlimit (from + 2, n, (int) (trimB * n));
+        // The bar grid always hangs on your track's own bar one, also when you move the lines:
+        // from there we step whole bars until we are inside the part you picked. Counting from
+        // the line itself would put the track a fraction of a bar out of time with the loop.
+        const double one = downbeat >= 0 ? (double) downbeat : (double) from;
+        double startD = one + std::ceil ((from - one) / barLen - 1.0e-6) * barLen;
+        while (startD < from - 1.0)
+            startD += barLen;
+        int start = (int) std::llround (startD);
+        if (start >= to - 2)
+            start = juce::jlimit (0, juce::jmax (0, to - 2), (int) std::llround (one));
+        if (start < 0 || start >= to - 2)
+            start = from;
+        // whole bars only, and never past the end. If the last bar is a handful of samples short
+        // (rounding on the downbeat), start those few samples earlier instead of dropping a whole
+        // bar - a bar less would put your track a bar out of time with the loop.
+        int bars = (int) std::floor ((to - start + 64) / barLen);
+        while (bars >= 1)
+        {
+            int end = start + (int) std::llround (bars * barLen);
+            if (end <= n)
+                break;
+            if (const int over = end - n; start - over >= from)
+            {
+                start -= over;
+                break;
+            }
+            --bars;
+        }
+        if (bars >= 1 && barLen > 64.0)
+        {
+            loopA = start;
+            loopB = juce::jmin (n, start + (int) std::llround (bars * barLen));
+        }
+    }
+    slotPreviewLoopA = loopA;
+    slotPreviewLoopB = loopB;
+    slotPreviewTempo = slot == kTrackSlot ? trackTempo : 0.0;   // your track runs at the loop's tempo
     slotPreviewTrimStart = slot >= 0 ? trimA : 0.0f;
     slotPreviewTrimEnd   = slot >= 0 ? trimB : 1.0f;
     if (slot < 0)
@@ -1575,14 +1665,20 @@ void SliceTribeProcessor::setSlotPreview (int slot)
         slotPreviewRate = fileRate;
     }
     // on stop the audio keeps standing: the audio thread fades out and then simply stops reading
-    if (slot >= 0)
-        preview = false;                            // the loop preview and a single sample never play together
+    if (slot >= 0 && slot != kTrackSlot)
+        preview = false;              // listening to one sample on its own: the loop steps aside
+    if (slot == kTrackSlot)
+        preview = true;               // your own track and the loop play together - that is the point
+    else if (wasTrack && slot < 0)
+        preview = false;              // and they stop together as well
     slotPreviewIndex = slot;
     slotPreviewVersion.fetch_add (1);
+    if (slot == kTrackSlot || (wasTrack && slot < 0))
+        previewStartVersion.fetch_add (1);   // both from the one, in the same block
 }
 
 /** Plays the chosen sample on top of everything else, at its own tempo, looping. */
-void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, double rate)
+void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, double rate, bool restart)
 {
     const int numSamples = buffer.getNumSamples();
     if (numSamples <= 0 || buffer.getNumChannels() == 0 || rate <= 0.0)
@@ -1606,16 +1702,30 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
     }
     if (slotPlaying == nullptr || slotPlaying->getNumSamples() < 2)
         return;
-    slotPlayStep = juce::jlimit (0.01, 8.0, slotPreviewRate.load() / rate);   // follows a sample-rate change
+    // follows a sample-rate change, and your own track is played at the tempo the loop runs at,
+    // so the two always fit - even when the DAW is on another tempo than the track you dropped in
+    double speed = slotPreviewRate.load() / rate;
+    if (const double own = slotPreviewTempo.load(); own >= 40.0 && own <= 300.0)
+        speed *= juce::jlimit (0.25, 4.0, getLoopBpm() / own);
+    slotPlayStep = juce::jlimit (0.01, 8.0, speed);
 
     const bool on = slotPreviewIndex.load() >= 0;
     const auto& b = *slotPlaying;
     const int len = b.getNumSamples();
-    // the two lines: listening plays only the part you picked
-    const int cutA = juce::jlimit (0, len - 2, (int) (slotPreviewTrimStart.load() * len));
-    const int cutB = juce::jlimit (cutA + 2, len, (int) (slotPreviewTrimEnd.load() * len));
-    if (slotPlayPos < cutA || slotPlayPos >= cutB)
-        slotPlayPos = cutA;
+    // your own track plays in whole bars from its own one, anything else plays between the lines
+    const int barA = slotPreviewLoopA.load(), barB = slotPreviewLoopB.load();
+    const bool inBars = barA >= 0 && barB > barA + 1 && barB <= len;
+    const int cutA = inBars ? barA : juce::jlimit (0, len - 2, (int) (slotPreviewTrimStart.load() * len));
+    const int cutB = inBars ? barB : juce::jlimit (cutA + 2, len, (int) (slotPreviewTrimEnd.load() * len));
+    if (restart || slotPlayPos < cutA || slotPlayPos >= cutB)
+        slotPlayPos = cutA;                       // the loop is at its one too: they start together
+    // the DAW is playing: your track hangs on the DAW's bar count, exactly like the loop does
+    if (const double follow = trackFollowPos; follow >= 0.0 && inBars)
+    {
+        const double want = juce::jlimit ((double) cutA, (double) cutB - 1.0, follow);
+        if (std::abs (want - slotPlayPos) > 64.0)
+            slotPlayPos = want;
+    }
     const float* inL = b.getReadPointer (0);
     const float* inR = b.getReadPointer (b.getNumChannels() > 1 ? 1 : 0);
     float* outL = buffer.getWritePointer (0);
@@ -1637,7 +1747,7 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
             outR[i] += (inR[i0] + (inR[i1] - inR[i0]) * f) * g;
         slotPlayPos += slotPlayStep;
         if (slotPlayPos >= cutB)
-            slotPlayPos = cutA;
+            slotPlayPos -= (double) (cutB - cutA);   // keep the remainder: no drift against the loop
     }
     slotPreviewPos = len > 1 ? slotPlayPos / (double) len : -1.0;
 }
@@ -1685,6 +1795,7 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
     {
         trackRegrid = true;   // the fit grid follows the corrected tempo (measured by the worker)
         updateTrackBpm();     // ... and so does the loop: move your track's tempo, the loop moves with it
+        rearmTrackPreview();  // ... and so does what you are listening to
     }
     prepareInterrupt = true;
     slotsVersion.fetch_add (1);
@@ -1751,6 +1862,8 @@ void SliceTribeProcessor::regridTrack()
         return;
 
     std::array<float, 16> profile {};
+    int down = -1;
+    bool moved = false;
     const int n = audio->getNumSamples();
     const int s0 = juce::jlimit (0, n, (int) (a0 * n));
     const int s1 = juce::jlimit (s0, n, (int) (a1 * n));
@@ -1760,21 +1873,46 @@ void SliceTribeProcessor::regridTrack()
         // profile really is the one - and the loop's one lands on your track's one.
         if (s0 == 0 && s1 == n)
         {
-            profile = engine::gridProfile (*audio, fileRate, bpm, engine::findDownbeat (*audio, fileRate, bpm));
+            down = engine::findDownbeat (*audio, fileRate, bpm);
+            profile = engine::gridProfile (*audio, fileRate, bpm, down);
         }
         else
         {
             juce::AudioBuffer<float> part (audio->getNumChannels(), s1 - s0);
             for (int ch = 0; ch < part.getNumChannels(); ++ch)
                 part.copyFrom (ch, 0, *audio, ch, s0, s1 - s0);
-            profile = engine::gridProfile (part, fileRate, bpm, engine::findDownbeat (part, fileRate, bpm));
+            const int d = engine::findDownbeat (part, fileRate, bpm);
+            down = d >= 0 ? s0 + d : -1;
+            profile = engine::gridProfile (part, fileRate, bpm, d);
         }
     }
     {
         const juce::ScopedLock sl (slotLock);
         if (slotAudio[(size_t) kTrackSlot].loadId == loadId)   // still the same file
+        {
             slotAudio[(size_t) kTrackSlot].gridProfile = profile;
+            slotAudio[(size_t) kTrackSlot].downbeat = down;
+            moved = true;
+        }
     }
+    if (moved)
+        rearmTrackPreview();   // bar one moved: line up what you are listening to again
+}
+
+/** Your own track is playing and something about it changed (tempo, lines, straightened copy):
+    work out its bars again so it keeps running with the loop instead of drifting off. */
+void SliceTribeProcessor::rearmTrackPreview()
+{
+    if (slotPreviewIndex.load() != kTrackSlot)
+        return;
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        warpPreviewRearm = true;   // the worker asks the message thread to do it
+        triggerAsyncUpdate();
+        return;
+    }
+    slotPreviewIndex = -1;         // so setSlotPreview does not read it as "click again = stop"
+    setSlotPreview (kTrackSlot);
 }
 
 /** MY TRACK leads: as long as a track is loaded, its tempo is the tempo of the loop. */
@@ -1940,20 +2078,28 @@ void SliceTribeProcessor::setSlotTrim (int slot, float start, float end)
         slotPreviewTrimEnd = b;
     }
     if (slot == kTrackSlot)
-        trackRegrid = true;   // the worker re-measures the part you picked
+    {
+        trackRegrid = true;      // the worker re-measures the part you picked
+        rearmTrackPreview();     // and what you are listening to follows the lines, in whole bars
+    }
     slotsVersion.fetch_add (1);   // no re-preparing needed: the lines only steer where slices come from
     requestUpdate();
 }
 
 void SliceTribeProcessor::setFallbackBpm (double b)
 {
-    fallbackBpm = juce::jlimit (40.0, 300.0, b);
+    const double v = juce::jlimit (40.0, 300.0, b);
+    fallbackBpm = v;
+    if (! hostProvidesTempo.load())
+        hostBpm = v;                 // without a DAW this is the tempo, also before audio runs
+    upToDate = false;
+    requestUpdate();
 }
 
 void SliceTribeProcessor::setPreview (bool p)
 {
     if (p && ! preview.load())
-        previewRestart = true;
+        previewStartVersion.fetch_add (1);   // your track, if it is playing, starts on the one too
     preview = p;
 }
 
@@ -2020,6 +2166,21 @@ void SliceTribeProcessor::applyParamValues (const ParamMap& values)
 
 /** Everything back to the factory position: the knobs, the FX and "back to normal".
     Used by CLEAR ALL, so you really start from scratch. */
+/** Every knob back to its default, without touching your samples or the preset you are on. */
+void SliceTribeProcessor::knobsToNeutral()
+{
+    auto ids = presetParameterIds();
+    for (auto& id : ids)
+        if (auto* prm = apvts.getParameter (id))
+            if (std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-4f)
+            {
+                prm->beginChangeGesture();
+                prm->setValueNotifyingHost (prm->getDefaultValue());
+                prm->endChangeGesture();
+            }
+    crazyActive = false;
+}
+
 void SliceTribeProcessor::resetSettings()
 {
     auto ids = presetParameterIds();
@@ -2540,6 +2701,7 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
     }
     root.appendChild (sc, nullptr);
     root.setProperty ("editorWidth", editorWidth.load(), nullptr);
+    root.setProperty ("newLoopNeutral", newLoopNeutral.load(), nullptr);
     root.setProperty ("bpm", fallbackBpm.load(), nullptr);   // the tempo you set when no DAW provides one
     root.setProperty ("keyBeforeFit", keyBeforeReference.load(), nullptr);   // the KEY to go back to when FIT goes off
 
@@ -2565,8 +2727,21 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     autoPickRequest = 0;      // a queued job must never overwrite the project that is being opened
     stemsRequest = false;
     jobBusy = false;
-    if (slotPreviewIndex.load() >= 0 && juce::MessageManager::getInstance()->isThisTheMessageThread())
-        setSlotPreview (-1);  // never keep playing the previous project's sample
+    if (slotPreviewIndex.load() >= 0)
+    {
+        // never keep playing the previous project's sample - also when the host loads a project
+        // from another thread, where the message-thread bookkeeping of setSlotPreview cannot run
+        if (juce::MessageManager::getInstance()->isThisTheMessageThread())
+            setSlotPreview (-1);
+        else
+        {
+            slotPreviewIndex = -1;       // the audio thread fades it out and stops reading
+            slotPreviewLoopA = -1;
+            slotPreviewLoopB = -1;
+            preview = false;
+            slotPreviewVersion.fetch_add (1);
+        }
+    }
     crazyActive = false;      // and "back to normal" never carries over into another project
     pendingReferenceKey = -1; // nor does anything FIT TO TRACK remembered about the previous one
     keyBeforeReference = -1;  // (the project may put this one back, below)
@@ -2584,11 +2759,13 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
     auto arr = root.getChildWithName ("ARRANGEMENT");
 
     editorWidth = juce::jlimit (0, 4000, (int) root.getProperty ("editorWidth", 0));
+    newLoopNeutral = (bool) root.getProperty ("newLoopNeutral", false);
     if (const double savedBpm = root.getProperty ("bpm", 0.0); savedBpm > 20.0)
         fallbackBpm = juce::jlimit (40.0, 300.0, savedBpm);
     keyBeforeReference = juce::jlimit (-1, 24, (int) root.getProperty ("keyBeforeFit", -1));
     auto params = root.createCopy();
     params.removeProperty ("editorWidth", nullptr);
+    params.removeProperty ("newLoopNeutral", nullptr);
     params.removeProperty ("bpm", nullptr);
     params.removeProperty ("keyBeforeFit", nullptr);
     params.removeProperty ("midiMap", nullptr);

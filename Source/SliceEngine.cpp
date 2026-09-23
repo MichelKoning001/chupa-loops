@@ -1746,7 +1746,9 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             {
                 const double aSlot = uniform (alt), aPos = uniform (alt);
                 int sl = 0; double bt = 0.0;
-                choose (aSlot, aPos, keepPos && attempt <= 3, octaveOn, sl, bt);
+                // still the groove lock you asked for: dropping it after a few tries made CHAOS
+                // at 0% land on the very same spots as CHAOS at 100%
+                choose (aSlot, aPos, keepPos, octaveOn, sl, bt);
                 if (! isSilent (sl, bt, octaveOn))
                 {
                     slot = sl;
@@ -1863,10 +1865,22 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             c.srcBeats = juce::jlimit (0.0, juce::jmax (0.0, srcBeats - 0.05), at);
         };
 
+        // and it never takes over the whole loop: at most a third of the slices is handed out,
+        // otherwise a short loop with many samples would be all hand-overs and the knobs would
+        // have nothing left to work on.
+        // Room enough (at least two slices per sample)? then everyone can be given one. A short
+        // loop with many samples hands out at most a third, so the knobs still have something to
+        // work on instead of the loop being nothing but hand-overs.
+        int handedOut = 0;
+        const int maxHandOut = (int) hits.size() >= 2 * (int) active.size()
+                                   ? (int) active.size()
+                                   : juce::jmax (1, (int) hits.size() / 3);
         for (int a2 : active)
         {
             if (got[(size_t) a2] > 0 || (! weightsOff && slots[(size_t) a2].weight <= 0.001f))
                 continue;
+            if (handedOut >= maxHandOut)
+                break;
 
             // the samples with the most to spare first, and keep trying: the fattest one may have
             // nothing but locked or glitched slices
@@ -1877,23 +1891,63 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             std::stable_sort (donors.begin(), donors.end(),
                               [&] (int x, int y) { return got[(size_t) x] > got[(size_t) y]; });
 
+            // Which slice is handed over: never a locked one, and never one you clicked yourself -
+            // that slice is yours, and taking it over every render would make it unchangeable.
+            // Of what is left, one is picked from the seed instead of always the last one, so the
+            // hand-over lands somewhere else in every loop.
+            auto touched = [&arr] (const Choice& c)
+            {
+                const size_t h = (size_t) c.hitIndex;
+                return (h < arr.forceOwn.size() && arr.forceOwn[h] != 0)
+                    || (h < arr.locked.size() && arr.locked[h] != 0);
+            };
             bool given = false;
-            for (int pass = 0; pass < 2 && ! given; ++pass)      // a plain slice first, a glitched one if need be
+            // pass 0: a plain slice you did not touch. 1: a glitched one. 2: anything not locked.
+            for (int pass = 0; pass < 3 && ! given; ++pass)
                 for (int from : donors)
                 {
-                    for (size_t k = choicesOut.size(); k-- > 0;)
+                    // Every slice of this sample, locked or not. Where we start looking does not
+                    // depend on what you locked or clicked, so locking one slice never sends the
+                    // hand-over to another one - it only skips the slice you locked.
+                    // a slice in a fill is never handed over: the roll at the end of a phrase
+                    // has to stay a roll
+                    auto isFill = [&] (const Choice& c)
                     {
-                        auto& c = choicesOut[k];
-                        if (c.slot != from || c.locked || (pass == 0 && c.glitch))
+                        const size_t h2 = (size_t) c.hitIndex;
+                        return h2 < hits.size() && inFill (hits[h2]);
+                    };
+                    std::vector<size_t> pool;
+                    for (size_t k = 0; k < choicesOut.size(); ++k)
+                        if (choicesOut[k].slot == from && ! isFill (choicesOut[k])
+                            && ! (pass == 0 && choicesOut[k].glitch))
+                            pool.push_back (k);
+                    if (pool.empty())
+                        continue;
+                    // hangs on the source seeds, not on the rhythm seed: RHY keeps the sources,
+                    // so the hand-over may not move when only the rhythm is re-rolled
+                    juce::uint64 pk = hashCombine (0x51CEull, (juce::uint64) a2 + 1);
+                    for (size_t q = 0; q < juce::jmin<size_t> (8, arr.hitSeeds.size()); ++q)
+                        pk = hashCombine (pk, arr.hitSeeds[q]);
+                    const size_t startAt = (size_t) (uniform (pk) * pool.size()) % pool.size();
+                    size_t k = choicesOut.size();
+                    for (size_t step2 = 0; step2 < pool.size(); ++step2)
+                    {
+                        const size_t cand = pool[(startAt + step2) % pool.size()];
+                        const auto& c = choicesOut[cand];
+                        if (c.locked || (pass < 2 && touched (c)))
                             continue;
-                        giveSlice (c, a2);
-                        --got[(size_t) from];
-                        ++got[(size_t) a2];
-                        given = true;
+                        k = cand;
                         break;
                     }
-                    if (given)
-                        break;
+                    if (k >= choicesOut.size())
+                        continue;
+                    giveSlice (choicesOut[k], a2);
+                    --got[(size_t) from];
+                    ++got[(size_t) a2];
+                    ++handedOut;
+
+                    given = true;
+                    break;
                 }
             if (given || fitSkipped.empty())
                 continue;   // nothing to spare and nothing set aside: this one has to wait
@@ -2383,13 +2437,21 @@ int engine::findDownbeat (const juce::AudioBuffer<float>& b, double rate, double
         energy[(size_t) (k % 4)] += e / juce::jmax (1, n * b.getNumChannels());
         ++count[(size_t) (k % 4)];
     }
-    int best = 0;
-    double bestE = -1.0;
+    std::array<double, 4> avg {};
+    double bestE = 0.0;
     for (int i = 0; i < 4; ++i)
     {
-        const double avg = count[(size_t) i] > 0 ? energy[(size_t) i] / count[(size_t) i] : 0.0;
-        if (avg > bestE) { bestE = avg; best = i; }
+        avg[(size_t) i] = count[(size_t) i] > 0 ? energy[(size_t) i] / count[(size_t) i] : 0.0;
+        bestE = juce::jmax (bestE, avg[(size_t) i]);
     }
+    // the first of the beats that carry the most low end. Beats that are as strong as the
+    // strongest count as equal, so on a track where every beat is the same kick the one is the
+    // first beat there is, instead of a coin toss between four beats that sound identical.
+    int best = 0;
+    for (int i = 0; i < 4; ++i)
+        if (avg[(size_t) i] >= bestE * 0.98) { best = i; break; }
+    if (bestE <= 0.0)
+        best = 0;
     const double bar = 4.0 * beatLen;
     double start = gridOffset + best * beatLen;
     while (start < 0.0)        start += bar;
