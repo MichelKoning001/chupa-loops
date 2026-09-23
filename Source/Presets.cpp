@@ -7,7 +7,15 @@ const juce::StringArray& presetParameterIds()
 {
     static const juce::StringArray ids { "pattern", "length", "motif", "sliceMode", "sliceSize", "stretch", "style", "chaos",
                                          "variation", "gate", "swing", "amount", "reverse", "octave", "fade", "sensitivity",
-                                         "fill", "energy", "feel", "fxCutoff", "fxReso", "fxEnv", "fxDecay", "fxPump", "fxDrive", "fxLowCut", "fxWidth" };
+                                         "fill", "energy", "accent", "fxCutoff", "fxReso", "fxEnv", "fxDecay", "fxPump", "fxDrive", "fxLowCut", "fxWidth" };
+    return ids;
+}
+
+const juce::StringArray& neutralParameterIds()
+{
+    static const juce::StringArray ids { "style", "chaos", "variation", "gate", "swing", "amount", "reverse",
+                                         "octave", "fade", "sensitivity", "energy", "accent",
+                                         "fxCutoff", "fxReso", "fxEnv", "fxDecay", "fxPump", "fxDrive", "fxLowCut", "fxWidth" };
     return ids;
 }
 
@@ -114,7 +122,7 @@ juce::StringArray PresetManager::getCategories() const
 
 bool PresetManager::isKeptParameter (const juce::String& id)
 {
-    return id.startsWith ("fx") || id == "fill" || id == "feel";   // the finishing layer survives a preset
+    return id.startsWith ("fx") || id == "fill";   // the finishing layer survives a preset
 }
 
 void PresetManager::apply (const PresetData& p)

@@ -38,8 +38,6 @@ namespace choices
     inline const int               fillBars[] { 0, 4, 8, 16, 32 };
 
     inline const juce::StringArray midiModes { "Control", "Slices", "Keys" };
-    inline const juce::StringArray feels     { "Normal", "Half time", "Double time" };
-    inline const double            feelFactor[] { 1.0, 2.0, 0.5 };   // multiplies the source tempo
 
     inline const juce::StringArray styles    { "Clean", "Glitch", "Lo-Fi" };
     inline const juce::StringArray stretchModes { "Beats", "Smooth" };
@@ -77,7 +75,7 @@ struct Settings
     int    stretchMode = stretchBeats;
     int    fillBars    = 0;       // 0 = off: a roll at the end of every phrase of this many bars
     float  energy      = 0.0f;    // 0..1: the loop gets busier and more glitchy towards the end
-    int    feel        = 0;       // 0 normal, 1 half time, 2 double time (speed of the source material)
+    float  accent      = 0.0f;    // 0..1: slices on the strong beats louder than the ones in between
     float  fit         = 0.0f;    // 0..2: how hard the loop stays out of the reference track's way
     std::array<float, 16> fitProfile {};   // how busy the reference track is on every 1/16 of a bar
 
@@ -104,7 +102,7 @@ struct Hit
 struct Arrangement
 {
     juce::uint64 seed = 1;
-    juce::uint64 rhythmSeed = 1;   // reverses, octaves and rolls: changed by "new rhythm", kept by "new sources"
+    juce::uint64 rhythmSeed = 1;   // reverses, octaves and rolls; a locked hit keeps the one it had
     std::vector<juce::uint64> hitSeeds;
     std::vector<juce::uint8>  locked;
     std::vector<juce::uint8>  forceOwn;   // a re-rolled hit inside a repeated motif
@@ -112,8 +110,6 @@ struct Arrangement
 
     void resizeFor (size_t numHits);
     void regenerate (juce::uint64 newSeed);      // keeps locked hits
-    void regenerateRhythm (juce::uint64 newSeed);// only the rhythm seed: the sources stay
-    void regenerateSources (juce::uint64 salt);  // only the sources: the rhythm stays
     void reroll (size_t hitIndex, juce::uint64 salt);
     /** Locks or unlocks a hit; locking freezes the sound it has right now. */
     void setLocked (size_t hitIndex, bool isLocked);
@@ -155,6 +151,7 @@ struct PreparedSlot
     bool withOctave = false;
     float onsetSensitivity = -1.0f;
     float rms = 0.0f;
+    float gain = 1.0f;          // this sample's own level (from gainDb)
     int loadId = -1;
 };
 
@@ -167,6 +164,8 @@ struct SlotState
     float  trimStart = 0.0f;    // only the part between these two lines is used (0..1 of the sample)
     float  trimEnd   = 1.0f;
     float  warp      = 0.0f;    // 0..1: how hard a human recording is pulled onto the grid
+    float  gainDb    = 0.0f;    // -24..+24 dB: level of this sample, so a raw take sits next to a mastered loop
+    int    stretchMode = -1;    // -1 = follow the global setting, otherwise stretchBeats / stretchSmooth
 };
 
 //==============================================================================

@@ -20,6 +20,10 @@ const std::vector<PresetData>& factoryPresets();
 /** Parameters stored in a preset (not Volume, Key or the New Loop trigger). */
 const juce::StringArray& presetParameterIds();
 
+/** What "NEW LOOP: ALL NEUTRAL" puts back: the CHARACTER | FX panel. Your rhythm, length,
+    repeat, slice mode, slice size, stretch mode and output level are yours to keep. */
+const juce::StringArray& neutralParameterIds();
+
 /** Factory + user presets, loading, saving and "modified" tracking. Message thread only,
     except loadFactoryFromHost(), which a host may call from another thread. */
 class PresetManager
@@ -30,7 +34,7 @@ public:
     static juce::File getUserFolder();
     static juce::File fileForName (const juce::String& presetName);
     static constexpr const char* fileExtension = ".chupapreset";
-    /** FX, fill and time feel are kept when a factory preset doesn't set them. */
+    /** FX and fill are kept when a factory preset doesn't set them. */
     static bool isKeptParameter (const juce::String& id);
 
     void rescanUserPresets();

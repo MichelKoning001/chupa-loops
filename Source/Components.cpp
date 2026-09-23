@@ -375,7 +375,9 @@ void Knob::paint (juce::Graphics& g)
     const bool active = slider.isMouseOverOrDragging();
     g.setColour (active ? colours::text() : colours::label());
     g.setFont (uiFont (11.0f, 1));
-    g.drawText (active ? slider.getTextFromValue (slider.getValue()) : caption.toUpperCase(), r, juce::Justification::centredTop);
+    // a long name is squeezed instead of cut off, so every knob keeps its name
+    g.drawFittedText (active ? slider.getTextFromValue (slider.getValue()) : caption.toUpperCase(),
+                      r.toNearestInt(), juce::Justification::centredTop, 1, 0.82f);
     drawMidiTag (g, *this, paramId, getLocalBounds().toFloat().removeFromTop (14.0f).removeFromRight (40.0f));
 }
 
@@ -495,12 +497,18 @@ void DragNumber::paint (juce::Graphics& g)
     }
     g.setColour (highlighted ? colour : (locked ? colours::dim() : colours::text()));
     g.setFont (uiFont (12.0f, 1));
-    g.drawFittedText (format ? format (value) : juce::String (value), textArea, juce::Justification::centred, 1);
+    g.drawFittedText (format ? format (value) : juce::String (value), textArea, juce::Justification::centred, 1, 0.75f);
 }
 
 void DragNumber::mouseDown (const juce::MouseEvent& e)
 {
-    if (locked || e.mods.isPopupMenu()) return;   // a right-click belongs to the slot's menu
+    if (locked) return;
+    if (e.mods.isPopupMenu())
+    {
+        // a field whose double-click opens the text editor has no other way back to its default
+        if (resetOnRightClick && onReset) onReset();
+        return;
+    }
     dragStartValue = value;
     dragging = true;
     nudged = false;
@@ -557,6 +565,20 @@ bool DragNumber::keyPressed (const juce::KeyPress& k)
     return true;
 }
 
+bool DragNumber::parseEntry (const juce::String& text, double minValue, double maxValue, double& out)
+{
+    // a field that goes below zero (the slot level) must be able to take "0" and "-6";
+    // a field that only goes up (tempo, share) ignores 0 and negatives, so a typo keeps the old value
+    const auto txt = text.retainCharacters ("-0123456789.,").replaceCharacter (',', '.');
+    if (! txt.containsAnyOf ("0123456789"))
+        return false;
+    const double v = txt.getDoubleValue();
+    if (v <= 0.0 && minValue >= 0.0)
+        return false;
+    out = juce::jlimit (minValue, maxValue, v);
+    return true;
+}
+
 void DragNumber::showEditor()
 {
     editor = std::make_unique<juce::TextEditor>();
@@ -573,10 +595,10 @@ void DragNumber::showEditor()
         if (editor == nullptr) return;
         if (apply)
         {
-            const double v = editor->getText().retainCharacters ("0123456789.,").replaceCharacter (',', '.').getDoubleValue();
-            if (v > 0.0)
+            double v = value;
+            if (parseEntry (editor->getText(), minValue, maxValue, v))
             {
-                value = juce::jlimit (minValue, maxValue, v);
+                value = v;
                 if (onChange) onChange (value);
                 if (onDragEnd) onDragEnd (value);
             }
@@ -627,11 +649,33 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     warpField.onDragEnd = [this] (double v) { proc.setSlotWarp (index, (float) (v / 100.0)); };
     warpField.onClick = [this] { proc.setSlotWarp (index, info.warp > 0.001f ? 0.0f : 1.0f); };
     warpField.onReset = [this] { proc.setSlotWarp (index, 0.0f); };
-    warpField.setTooltip ("STRAIGHT: pulls a human recording onto the grid - an old record, a live take, a vocal.\n"
+    warpField.setTooltip ("STRAIGHT (STR) - not the same as STRETCH in the panel.\nPulls a human recording onto the grid - an old record, a live take, a vocal.\n"
                           "Click to switch it on, drag up/down for how far: 100% is dead straight, "
                           "60% takes the wobble out and keeps the feel.\nDouble-click = off.\n"
                           "STRETCH on Smooth keeps the pitch (use that for vocals), on Beats the pitch rides along like on vinyl.");
     addAndMakeVisible (warpField);
+
+    gainField.minValue = -24; gainField.maxValue = 24; gainField.step = 0.5; gainField.pixelsPerStep = 3;
+    gainField.format = [] (double v) { return (v > 0 ? "+" : "") + juce::String (v, v == (int) v ? 0 : 1) + " dB"; };
+    gainField.pixelsPerStep = 3;
+    gainField.onChange = [this] (double v) { proc.setSlotGain (index, (float) v); };   // live while you drag
+    gainField.onDragEnd = [this] (double v) { proc.setSlotGain (index, (float) v); };
+    gainField.allowTextEntry = true;
+    gainField.resetOnRightClick = true;
+    gainField.onReset = [this] { proc.setSlotGain (index, 0.0f); };
+    gainField.setTooltip ("Level of this sample in the loop, -24 to +24 dB.\nHandy when a mastered loop sits next to a raw recording.\n"
+                          "Listening to the sample uses this level too.\nDrag up/down (Shift = fine), double-click to type, right-click = 0 dB.");
+    addAndMakeVisible (gainField);
+
+    // -1 = follow the panel, 0 = Beats, 1 = Smooth
+    stretchField.minValue = -1; stretchField.maxValue = 1; stretchField.step = 1; stretchField.pixelsPerStep = 12;
+    stretchField.format = [] (double v) { return v < -0.5 ? juce::String ("AUTO") : (v < 0.5 ? juce::String ("BEATS") : juce::String ("SMOOTH")); };
+    stretchField.onDragEnd = [this] (double v) { proc.setSlotStretch (index, (int) v); };
+    stretchField.onClick = [this] { proc.setSlotStretch (index, info.stretchMode >= 1 ? -1 : info.stretchMode + 1); };
+    stretchField.onReset = [this] { proc.setSlotStretch (index, -1); };
+    stretchField.setTooltip ("STRETCH for this sample only.\nAUTO follows the panel. Beats keeps the attacks exactly as recorded (drums, bass),\n"
+                             "Smooth time-stretches and keeps the pitch (vocals, pads).\nClick to step through, double-click = AUTO.");
+    addAndMakeVisible (stretchField);
 
     playButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb6"));
     playButton.setTooltip ("Listen to this sample on its own, at its own tempo (it keeps looping) - only the part between the two lines.\nClick again to stop.");
@@ -649,6 +693,8 @@ SlotComponent::SlotComponent (SliceTribeProcessor& p, int i) : proc (p), index (
     {
         powerButton.setVisible (false);
         transposeField.setVisible (false);
+        gainField.setVisible (false);
+        stretchField.setVisible (false);
         playButton.setTooltip ("Listen to the part between the two lines, looping. Click again to stop.");
         bpmField.setTooltip ("Tempo of your track - and with it the tempo of the loop: your track leads.\n"
                              "Move it and the loop moves with it. Correct it here if it is wrong.\n"
@@ -677,6 +723,14 @@ void SlotComponent::refresh (const SlotInfo& i)
     playButton.setVisible (show);
     weightField.setVisible (show);
     warpField.setVisible (show && ! isTrack());   // your own track is already on the grid
+    gainField.setVisible (show && ! isTrack());
+    stretchField.setVisible (false);
+    gainField.setValue (info.gainDb);
+    gainField.highlighted = std::abs (info.gainDb) > 0.05f;
+    gainField.colour = colours::slot (index);
+    stretchField.setValue (info.stretchMode);
+    stretchField.highlighted = info.stretchMode >= 0;
+    stretchField.colour = colours::cyan();
     warpField.setValue (juce::roundToInt (info.warp * 100.0f));
     warpField.highlighted = info.warp > 0.001f;
     warpField.colour = colours::cyan();
@@ -744,14 +798,17 @@ void SlotComponent::resized()
         clearButton.setBounds (getWidth() - 28, 8, 20, 20);
         return;
     }
-    powerButton.setBounds (bottom.removeFromRight (44));
-    bottom.removeFromRight (6);
-    transposeField.setBounds (bottom.removeFromRight (50));
-    bottom.removeFromRight (6);
-    bpmField.setBounds (bottom.removeFromRight (74));
-    clearButton.setBounds (getWidth() - 30, 8, 20, 20);
-    weightField.setBounds (getWidth() - 82, 8, 46, 20);
-    warpField.setBounds   (getWidth() - 132, 8, 44, 20);
+    powerButton.setBounds (bottom.removeFromRight (38));
+    bottom.removeFromRight (3);
+    transposeField.setBounds (bottom.removeFromRight (34));
+    bottom.removeFromRight (3);
+    gainField.setBounds (bottom.removeFromRight (46));
+    bottom.removeFromRight (3);
+    bpmField.setBounds (bottom.removeFromRight (58));
+    clearButton.setBounds (getWidth() - 28, 8, 20, 20);
+    weightField.setBounds  (getWidth() - 76, 8, 42, 20);
+    warpField.setBounds    (getWidth() - 120, 8, 40, 20);
+    stretchField.setBounds (0, 0, 0, 0);   // not on the face: it lives in the right-click menu
 }
 
 /** The strip the waveform is drawn in: where the two cut lines live. */
@@ -905,6 +962,8 @@ void SlotComponent::paint (juce::Graphics& g)
         drawTag (engine::keyName (info.key) + (info.keyShift != 0 ? juce::String::fromUTF8 ("\xe2\x86\x92") + engine::keyName (shifted) : juce::String()),
                  info.keyShift != 0 ? colours::cyan() : colours::dim());
     }
+    if (! isTrack() && info.stretchMode >= 0)   // this sample was taken off the panel's setting
+        drawTag (info.stretchMode == 1 ? "SMOOTH" : "BEATS", colours::cyan());
     const double stretchPct = (info.stretchRatio - 1.0) * 100.0;
     if (std::abs (stretchPct) >= 0.5)
         drawTag ((stretchPct > 0 ? "+" : "") + juce::String (juce::roundToInt (stretchPct)) + "%", colours::dim());
@@ -1003,6 +1062,14 @@ void SlotComponent::mouseUp (const juce::MouseEvent& e)
                                                    : juce::String (isTrack() ? "MY TRACK" : "SAMPLE"));
         m.addItem (1, "Listen to it", true, proc.getSlotPreview() == index);
         m.addItem (2, "Use the whole sample again", trimA > 0.001f || trimB < 0.999f);
+        if (! isTrack())
+        {
+            juce::PopupMenu st;
+            st.addItem (10, "Follow the panel", true, info.stretchMode < 0);
+            st.addItem (11, "Beats - attacks exactly as recorded (drums, bass)", true, info.stretchMode == 0);
+            st.addItem (12, "Smooth - time-stretched, keeps the pitch (vocals, pads)", true, info.stretchMode == 1);
+            m.addSubMenu ("Stretch this sample", st);
+        }
         m.addItem (3, isTrack() ? "Remove my track" : "Clear slot");
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
                          [safe = juce::Component::SafePointer<SlotComponent> (this)] (int r)
@@ -1011,6 +1078,7 @@ void SlotComponent::mouseUp (const juce::MouseEvent& e)
             if (r == 1) safe->proc.setSlotPreview (safe->index);
             if (r == 2) safe->applyTrim (0.0f, 1.0f, true);
             if (r == 3) safe->proc.clearSlot (safe->index);
+            if (r >= 10 && r <= 12) safe->proc.setSlotStretch (safe->index, r - 11);
         });
         return;
     }

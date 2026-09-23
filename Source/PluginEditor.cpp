@@ -54,7 +54,6 @@ MainView::MainView (SliceTribeProcessor& p)
       stretchSel (p.apvts, "stretch", 2),
       fillSel (p.apvts, "fill", 5),
       midiModeSel (p.apvts, "midiMode", 3),
-      feelSel (p.apvts, "feel", 3),
       chaos (p.apvts, "chaos", "Chaos", "Low: slices come from random places in your loops but keep their spot in the beat (the groove stays tight). High: anything goes."),
       variation (p.apvts, "variation", "Variation", "With Repeat on: how many slices change in every repeat of the motif."),
       gate (p.apvts, "gate", "Gate", "Note length. Lower = shorter, tighter, stabbier."),
@@ -65,6 +64,7 @@ MainView::MainView (SliceTribeProcessor& p)
       fade (p.apvts, "fade", "Fade", "Crossfade between slices. Short = punchy, longer = smoother.", true),
       sensitivity (p.apvts, "sensitivity", "Sens", "Transient detection sensitivity (Transient slice mode only).", true),
       energy (p.apvts, "energy", "Energy", "Builds the loop up: the further you get, the more rolls, octaves and reverses. 0% = the loop stays the same from start to end."),
+      accent (p.apvts, "accent", "Accent", "Slices on the strong beats of the bar play louder than the ones in between, so a 1/16 roll breathes instead of rattling. 0% = every slice the same."),
       volume (p.apvts, "gain", "Volume", "Output volume", true),
       fxCutoff (p.apvts, "fxCutoff", "Cutoff", "Low-pass filter over the whole loop. 100% = open."),
       fxReso (p.apvts, "fxReso", "Reso", "Filter resonance."),
@@ -106,11 +106,10 @@ MainView::MainView (SliceTribeProcessor& p)
                             "Slices: play the loop as an instrument - C1 = the whole loop, C#1 up to G8 = every different slice on its own key (use with DRAG MIDI).\n"
                             "Keys: the loop follows the key you play (C3 = original pitch, up to 2 octaves up or down), in time with your song.\n"
                             "In Slices and Keys the control notes are off.");
-    feelSel.setTooltip ("Speed of the sample material: Half time plays your loops at half speed (the beat grid stays), Double time twice as fast.\nRight-click = MIDI learn.");
-    for (auto* c : { &patternSel, &lengthSel, &motifSel, &modeSel, &sizeSel, &styleSel, &stretchSel, &fillSel, &midiModeSel, &feelSel })
+    for (auto* c : { &patternSel, &lengthSel, &motifSel, &modeSel, &sizeSel, &styleSel, &stretchSel, &fillSel, &midiModeSel })
         addAndMakeVisible (c);
 
-    for (auto* k : { &chaos, &variation, &gate, &swing, &amount, &reverse, &octave, &fade, &sensitivity, &energy })
+    for (auto* k : { &chaos, &variation, &gate, &swing, &amount, &reverse, &octave, &fade, &sensitivity, &energy, &accent })
         addAndMakeVisible (k);
     addChildComponent (volume);
     for (auto* k : { &fxCutoff, &fxReso, &fxEnv, &fxDecay, &fxLowCut, &fxDrive, &fxPump, &fxWidth })
@@ -145,12 +144,7 @@ MainView::MainView (SliceTribeProcessor& p)
 
     generateButton.setTooltip (juce::String (proc.isStandalone() ? "Make a new loop (N). Locked slices stay." : "Make a new loop. Locked slices stay.")
                                + "\nMIDI note C1 does the same (MIDI NOTES on Control). Right-click = MIDI learn.");
-    generateButton.onClick = [this]
-    {
-        if (proc.newLoopNeutral.load())
-            proc.knobsToNeutral();
-        proc.generateNew();
-    };
+    generateButton.onClick = [this] { proc.generateNew(); };   // the neutral choice lives in generateNew
     addAndMakeVisible (generateButton);
 
     crazyButton.onClick = [this]
@@ -171,19 +165,9 @@ MainView::MainView (SliceTribeProcessor& p)
     refreshNeutralButton();
 
     mutateButton.setButtonText ("MUTATE");
-    mutateButton.setTooltip ("A variation of this loop: about a quarter of the unlocked slices change, the rest stays.\nMIDI note F1 does the same (MIDI NOTES on Control).");
+    mutateButton.setTooltip ("Again, but a bit different: about a quarter of the unlocked slices gets another sound, the rest stays.\nMIDI note F1 does the same (MIDI NOTES on Control).");
     mutateButton.onClick = [this] { proc.mutate(); };
     addAndMakeVisible (mutateButton);
-
-    rhythmButton.setButtonText ("RHY");
-    rhythmButton.setTooltip ("New rhythm, same slices: only where the slices land changes.");
-    rhythmButton.onClick = [this] { proc.rerollRhythm(); };
-    addAndMakeVisible (rhythmButton);
-
-    sourcesButton.setButtonText ("SRC");
-    sourcesButton.setTooltip ("Same rhythm, other slices: the groove stays, the sounds change.");
-    sourcesButton.onClick = [this] { proc.rerollSources(); };
-    addAndMakeVisible (sourcesButton);
 
     autoPickButton.setButtonText ("AUTO PICK");
     autoPickButton.setTooltip ("Makes 8 loops, listens to them and keeps the best one: full enough, punchy, nicely spread over your samples.\nNeeds samples and a loop.");
@@ -338,11 +322,11 @@ void MainView::startTour()
           "Every click builds a brand new loop from slices out of all your loops. Not a chopped-up copy: a new groove." },
         { { 16, 310, 1088, 198 }, "4. Shape it",
           "Click a slice to swap it for another, right-click to lock it. AUTO PICK makes eight loops and keeps the best, KEEP parks a loop in a scene. "
-          "In the panel on the right: MUTATE for a variation, RHY for another rhythm, SRC for other sounds." },
+          "In the panel on the right: MUTATE gives you the same loop again, but a bit different." },
         { { 16, 620, 262, 164 }, "5. Rhythm",
           "Pick the rhythm the slices are placed on, and a FILL: the last half bar of every 4, 8, 16 or 32 bars becomes a roll, like a drummer's fill." },
         { { 290, 520, 266, 264 }, "6. Length and slicing",
-          "The length of the loop (1 to 32 bars), how often a motif repeats, how the slices are cut, and TIME FEEL for half or double speed." },
+          "The length of the loop (1 to 32 bars), how often a motif repeats, and how the slices are cut." },
         { { 384, 66, 354, 32 }, "7. Scenes",
           "Store your favourite loops in scenes A to H and switch between them while you play (MIDI C4 to G4)." },
         { { 924, 716, 180, 62 }, "8. Into your song",
@@ -353,7 +337,7 @@ void MainView::startTour()
 void MainView::updateCharacterTab()
 {
     const bool fxTab = charTabs.getSelected() == 1;
-    for (auto* k : { &chaos, &variation, &gate, &swing, &amount, &reverse, &octave, &fade, &sensitivity, &energy })
+    for (auto* k : { &chaos, &variation, &gate, &swing, &amount, &reverse, &octave, &fade, &sensitivity, &energy, &accent })
         k->setVisible (! fxTab);
     styleSel.setVisible (! fxTab);
     volume.setVisible (fxTab);
@@ -499,13 +483,12 @@ void MainView::paint (juce::Graphics& g)
     g.setFont (uiFont (11.0f, 1));
     const float lx = 304;
     g.drawText ("FILL (EVERY ... BARS)", juce::Rectangle<float> (24, 742, 246, 14), juce::Justification::centredLeft);
-    g.drawText ("LENGTH (BARS)", juce::Rectangle<float> (lx, 549, 240, 13), juce::Justification::centredLeft);
-    g.drawText ("REPEAT",        juce::Rectangle<float> (lx, 588, 240, 13), juce::Justification::centredLeft);
-    g.drawText ("SLICE MODE",    juce::Rectangle<float> (lx, 627, 120, 13), juce::Justification::centredLeft);
-    g.drawText ("STRETCH",       juce::Rectangle<float> (428, 627, 120, 13), juce::Justification::centredLeft);
-    g.drawText ("SLICE SIZE",    juce::Rectangle<float> (lx, 666, 240, 13), juce::Justification::centredLeft);
-    g.drawText ("TIME FEEL",     juce::Rectangle<float> (lx, 705, 240, 13), juce::Justification::centredLeft);
-    g.drawText ("MIDI NOTES",    juce::Rectangle<float> (lx, 744, 240, 13), juce::Justification::centredLeft);
+    g.drawText ("LENGTH (BARS)", juce::Rectangle<float> (lx, 552, 240, 13), juce::Justification::centredLeft);
+    g.drawText ("REPEAT",        juce::Rectangle<float> (lx, 597, 240, 13), juce::Justification::centredLeft);
+    g.drawText ("SLICE MODE",    juce::Rectangle<float> (lx, 642, 120, 13), juce::Justification::centredLeft);
+    g.drawText ("STRETCH",       juce::Rectangle<float> (428, 642, 120, 13), juce::Justification::centredLeft);
+    g.drawText ("SLICE SIZE",    juce::Rectangle<float> (lx, 687, 240, 13), juce::Justification::centredLeft);
+    g.drawText ("MIDI NOTES",    juce::Rectangle<float> (lx, 732, 240, 13), juce::Justification::centredLeft);
 
     if (charTabs.getSelected() == 1)
     {
@@ -550,31 +533,29 @@ void MainView::resized()
     fillSel.setBounds    (24, 758, 246, 22);
 
     // loop & slicing
-    lengthSel.setBounds   (304, 562, 238, 22);
-    motifSel.setBounds    (304, 601, 238, 22);
-    modeSel.setBounds     (304, 640, 114, 22);
-    stretchSel.setBounds  (428, 640, 114, 22);
-    sizeSel.setBounds     (304, 679, 238, 22);
-    feelSel.setBounds     (304, 718, 238, 22);
-    midiModeSel.setBounds (304, 757, 238, 22);
+    lengthSel.setBounds   (304, 565, 238, 22);
+    motifSel.setBounds    (304, 610, 238, 22);
+    modeSel.setBounds     (304, 655, 114, 22);
+    stretchSel.setBounds  (428, 655, 114, 22);
+    sizeSel.setBounds     (304, 700, 238, 22);
+    midiModeSel.setBounds (304, 745, 238, 22);
 
     // character | fx: tabs and style in the title row, knobs 5 x 2
     charTabs.setBounds (578, 525, 150, 24);
     styleSel.setBounds (732, 525, 166, 24);
-    const int kx = 580, ky = 560, kw = 64, kh = 84;
-    Knob* knobs[] = { &chaos, &variation, &gate, &swing, &amount, &reverse, &octave, &fade, &sensitivity, &energy };
-    for (int i = 0; i < 10; ++i)
-        knobs[i]->setBounds (kx + (i % 5) * kw, ky + (i / 5) * (kh + 6), kw, kh);
-    volume.setBounds (kx + 4 * kw, ky + kh + 6, kw, kh);   // FX tab: bottom right
+    const int kx = 576, ky = 560, kw = 54, kh = 84;   // 6 x 2, inside the panel at 568..912
+    Knob* knobs[] = { &chaos, &variation, &gate, &accent, &swing, &amount,
+                      &reverse, &octave, &fade, &sensitivity, &energy };
+    for (int i = 0; i < 11; ++i)
+        knobs[i]->setBounds (kx + (i % 6) * kw, ky + (i / 6) * (kh + 6), kw, kh);
+    volume.setBounds (kx + 5 * kw, ky + kh + 6, kw, kh);   // FX tab: bottom right
     Knob* fxKnobs[] = { &fxCutoff, &fxReso, &fxEnv, &fxDecay, &fxLowCut, &fxDrive, &fxPump, &fxWidth };
     for (int i = 0; i < 8; ++i)
-        fxKnobs[i]->setBounds (kx + (i % 5) * kw, ky + (i / 5) * (kh + 6), kw, kh);
+        fxKnobs[i]->setBounds (kx + (i % 6) * kw, ky + (i / 6) * (kh + 6), kw, kh);
 
     // actions
     generateButton.setBounds (936, 530, 156, 44);
-    mutateButton.setBounds   (936, 578, 76, 26);
-    rhythmButton.setBounds   (1016, 578, 36, 26);
-    sourcesButton.setBounds  (1056, 578, 36, 26);
+    mutateButton.setBounds   (936, 578, 156, 26);
     neutralButton.setBounds  (936, 608, 156, 22);
     crazyButton.setBounds    (936, 634, 156, 28);
     backButton.setBounds     (936, 666, 38, 24);
@@ -650,8 +631,9 @@ void MainView::refreshNeutralButton()
 {
     const bool on = proc.newLoopNeutral.load();
     neutralButton.setButtonText (on ? "NEW LOOP: ALL NEUTRAL" : "NEW LOOP: KEEP KNOBS");
-    neutralButton.setTooltip (on ? "NEW LOOP also puts every knob back to neutral first, so you start clean every time.\nClick to keep your settings instead."
-                                 : "NEW LOOP leaves the panel exactly as you set it.\nClick to have it start from neutral every time.");
+    neutralButton.setTooltip (on ? "NEW LOOP puts the CHARACTER | FX panel back to neutral first, so you start clean every time.\n"
+                                   "Your rhythm, length, slicing and level stay as they are.\nClick to keep the panel as you set it instead."
+                                 : "NEW LOOP leaves the CHARACTER | FX panel exactly as you set it.\nClick to have it start from neutral every time.");
     neutralButton.setColour (juce::TextButton::textColourOffId, on ? colours::cyan() : colours::dim());
     neutralButton.repaint();
 }
@@ -931,8 +913,6 @@ void MainView::updateState()
     generateButton.setEnabled (sliceable > 0);
     crazyButton.setEnabled (sliceable > 0);
     mutateButton.setEnabled (hasLoop);
-    rhythmButton.setEnabled (hasLoop);
-    sourcesButton.setEnabled (hasLoop);
     autoPickButton.setEnabled (hasLoop && ! proc.isJobBusy());
     keepButton.setEnabled (hasLoop);
     dragMidi.setEnabled (hasLoop);
@@ -949,6 +929,7 @@ void MainView::updateState()
     if (unlockButton.getButtonText() != unlockText)
         unlockButton.setButtonText (unlockText);
 
+    refreshNeutralButton();   // a project or an A/B compare can change it under us
     const auto st = proc.readSettings();
     const bool sensOn = st.sliceMode == 1, varOn = st.motifBars > 0 && st.motifBars < st.bars, amountOn = st.style != styleClean;
     // a knob that has no say right now is clearly switched off, not just a little paler

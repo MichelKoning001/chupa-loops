@@ -456,6 +456,115 @@ int main()
         CHECK (changedOthers > 5, "unlocked slices change on regenerate");
     }
 
+    // ------------------------------------------------------------------ 5b. level per sample and accents
+    {
+        auto renderAt = [&] (std::function<void (Settings&)> tweak, float slotGain)
+        {
+            Settings s;
+            s.bars = 2; s.pattern = patFree; s.sliceSteps = 1.0; s.motifBars = 0; s.chaos = 0.2f;
+            tweak (s);
+            auto pr = prepared;
+            for (auto& ps : pr) ps.gain = slotGain;
+            Arrangement a; a.seed = 5150;
+            auto hits = engine::buildHits (s, a.seed);
+            a.resizeFor (hits.size());
+            a.regenerate (5150);
+            return engine::render (pr, enabled, s, a, hits, hostBpm, hostRate);
+        };
+        auto rms = [] (const RenderResult& r, int from, int to)
+        {
+            double e = 0.0; int n = 0;
+            for (int i = juce::jmax (0, from); i < juce::jmin (to, r.audio.getNumSamples()); ++i)
+            {
+                const double v = r.audio.getSample (0, i);
+                e += v * v; ++n;
+            }
+            return n > 0 ? std::sqrt (e / n) : 0.0;
+        };
+
+        // level per sample: half the level really is half the level
+        auto full = renderAt ([] (Settings&) {}, 1.0f);
+        auto half = renderAt ([] (Settings&) {}, 0.5f);
+        const double rFull = rms (*full, 0, full->audio.getNumSamples());
+        const double rHalf = rms (*half, 0, half->audio.getNumSamples());
+        std::cout << "     level per sample: full " << juce::String (rFull, 4)
+                  << ", at -6 dB " << juce::String (rHalf, 4) << "\n";
+        CHECK (rFull > 0.01 && std::abs (rHalf / juce::jmax (1.0e-9, rFull) - 0.5) < 0.05,
+               "the level of a sample really sets how loud it is in the loop");
+
+        // accent: the slices on the beat come through louder than the ones in between
+        auto beatShare = [&] (const RenderResult& r)
+        {
+            const double step = r.samplesPerBeat() / 4.0;
+            double on = 0.0, off = 0.0;
+            int nOn = 0, nOff = 0;
+            for (int st = 0; st * step < r.audio.getNumSamples(); ++st)
+            {
+                const double v = rms (r, (int) (st * step), (int) ((st + 0.8) * step));
+                if (st % 4 == 0) { on += v; ++nOn; } else { off += v; ++nOff; }
+            }
+            return (nOn > 0 && nOff > 0 && off > 1.0e-9) ? (on / nOn) / (off / nOff) : 0.0;
+        };
+        const double flat = beatShare (*renderAt ([] (Settings&) {}, 1.0f));
+        const double accented = beatShare (*renderAt ([] (Settings& s2) { s2.accent = 1.0f; }, 1.0f));
+        std::cout << "     accent: on-beat vs in-between " << juce::String (flat, 3)
+                  << " -> " << juce::String (accented, 3) << "\n";
+        CHECK (accented > flat * 1.2, "accent makes the slices on the beat stand out");
+
+        // and it must not simply make the loop quieter, otherwise you are just turning it down
+        {
+            auto loudFlat = renderAt ([] (Settings&) {}, 1.0f);
+            auto loudAcc  = renderAt ([] (Settings& s2) { s2.accent = 1.0f; }, 1.0f);
+            const double a0 = rms (*loudFlat, 0, loudFlat->audio.getNumSamples());
+            const double a1 = rms (*loudAcc, 0, loudAcc->audio.getNumSamples());
+            std::cout << "     accent at 100%: loop level " << juce::String (a0, 4)
+                      << " -> " << juce::String (a1, 4) << "\n";
+            CHECK (a1 > a0 * 0.85 && a1 < a0 * 1.15, "accent keeps the loop at the same loudness");
+        }
+
+        // the four beats of the bar stay equal to each other, on every rhythm and every slice
+        // size: a house kick may not limp, also when a note starts just before the beat
+        for (auto setup4 : { std::pair<int, double> { patFourFloor, 4.0 },
+                             std::pair<int, double> { patFourFloor, 1.0 },
+                             std::pair<int, double> { patBroken, 1.0 },
+                             std::pair<int, double> { patRolling, 1.0 },
+                             std::pair<int, double> { patFree, 2.0 } })
+        {
+            Settings s4;
+            s4.bars = 1; s4.pattern = setup4.first; s4.sliceSteps = setup4.second; s4.motifBars = 0;
+            s4.chaos = 0.0f; s4.accent = 1.0f;
+            auto pr = prepared;
+            Arrangement a4; a4.seed = 24;
+            auto hits4 = engine::buildHits (s4, a4.seed);
+            a4.resizeFor (hits4.size());
+            a4.regenerate (24);
+            auto withAcc = engine::render (pr, enabled, s4, a4, hits4, hostBpm, hostRate);
+            s4.accent = 0.0f;
+            auto flat4 = engine::render (pr, enabled, s4, a4, hits4, hostBpm, hostRate);
+            // every beat has to get exactly the same treatment: different beats can be different
+            // samples, so compare each beat with itself, accent on against accent off
+            double lo = 1.0e9, hi = 0.0;
+            const double beatLen4 = withAcc->samplesPerBeat();
+            for (int b2 = 0; b2 < 4; ++b2)
+            {
+                // only the slice that starts on the beat, not the ones after it in that beat
+                const double win4 = juce::jmin (0.5, setup4.second / 4.0);
+                const double a5 = rms (*withAcc, (int) (b2 * beatLen4), (int) ((b2 + win4) * beatLen4));
+                const double f5 = rms (*flat4, (int) (b2 * beatLen4), (int) ((b2 + win4) * beatLen4));
+                if (f5 < 1.0e-6) continue;
+                const double ratio = a5 / f5;
+                lo = juce::jmin (lo, ratio); hi = juce::jmax (hi, ratio);
+            }
+            const juce::String what4 = juce::String (choices::patterns[setup4.first]) + " @ 1/"
+                                     + juce::String (juce::roundToInt (16.0 / setup4.second));
+            std::cout << "     " << what4 << " with accent at 100%: the four beats change by "
+                      << juce::String (lo, 3) << " .. " << juce::String (hi, 3) << " x\n";
+            CHECK (hi > 0.0 && hi - lo < 0.02, juce::String ("the four beats stay equally loud (") + what4 + ")");
+        }
+        CHECK (std::abs (flat - beatShare (*renderAt ([] (Settings& s2) { s2.accent = 0.0f; }, 1.0f))) < 1.0e-9,
+               "and at 0% every slice is still equally loud");
+    }
+
     // ------------------------------------------------------------------ 6a. the last slice is yours too
     // "every sample has to be heard" hands one slice over to a sample that drew nothing. That must
     // never land on the same slice every time (it was always the last one), and never on a slice
@@ -596,7 +705,7 @@ int main()
         }
 
         // and the lists next to them: rhythm, length, repeat, slice mode, slice size, style,
-        // stretch, fill, time feel and FIT. Every one of them has to change the loop.
+        // fill and FIT. Every one of them has to change the loop.
         {
             auto base = renderWith (patFree, 2.0, [] (Settings&) {});
             const auto baseSig = sig (*base);
@@ -684,8 +793,8 @@ int main()
                 CHECK (s0.size() == s2.size() && moved == 1, "re-rolling one slice changes that slice and no other");
             }
 
-            // STRETCH and TIME FEEL do their work when a sample is prepared, not when the loop is
-            // put together, so they are checked end to end in UITest.
+            // STRETCH does its work when a sample is prepared, not when the loop is put
+            // together, so it is checked end to end in UITest.
         }
 
         // swing must never turn the loop inside out: whatever the rhythm and the slice size,
@@ -813,7 +922,6 @@ int main()
                 s2.stretchMode = pick (2);
                 s2.fillBars = choices::fillBars[pick (5)];
                 s2.energy = (float) uniform (rs);
-                s2.feel = pick (3);
                 s2.fit = 2.0f * (float) uniform (rs);
                 for (int i = 0; i < 16; ++i) s2.fitProfile[(size_t) i] = (float) uniform (rs);
 

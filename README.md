@@ -24,13 +24,11 @@ Feed it up to 8 loops (basslines, for example). Chupa Loops cuts them into slice
 - **Use only a part of a sample:** two draggable lines over every waveform (the eight slots and the track box). Slices are only taken from between them, the preview plays just that part with a running playhead, and a double-click gives you the whole sample back.
 - **Share per sample:** how often slices come from each slot (0-200%), and a play button to hear a sample on its own.
 - **Energy:** the loop gets busier and more glitchy towards the end.
-- **Time feel:** half time or double time on the sample material, with the beat grid unchanged.
 - **AUTO PICK:** makes eight loops, scores them (full enough, punchy, nicely spread, varied) and keeps the best one. **KEEP** parks a loop in the first free scene.
-- **RHY / SRC:** re-roll only the rhythm (same sounds) or only the sources (same groove).
 - **MUTATE** (a variation: a quarter of the unlocked slices change) and **scenes A–H** to store and recall favorite loops live.
 - **Play it as an instrument** (MIDI NOTES): **Slices** = C1 plays the whole loop, C#1 and up every different slice; **Keys** = the loop follows the key you play (C3 = original pitch).
 - **MIDI control** (MIDI NOTES = Control; note names with middle C = C3): C1 = new loop, C#1/D1 = previous/next version, D#1 = unlock all, E1 = the skin's crazy button, F1 = mutate, C2–G#2 = rhythm, C3–F3 = length, C4–G4 = scenes A–H, program change = preset (0 = Init, 1–100 = factory presets). Right-click any knob or selector to **MIDI learn** a CC. The **New Loop** parameter can be automated.
-- **Fix one slice at a time.** Click a slice to replace just that slice. Right-click to lock it: locking freezes exactly the sound it has at that moment, through NEW LOOP, RHY, SRC and MUTATE. Use ◀ ▶ to go back to earlier versions (with their settings).
+- **Fix one slice at a time.** Click a slice to replace just that slice. Right-click to lock it: locking freezes exactly the sound it has at that moment, through NEW LOOP and MUTATE. Use ◀ ▶ to go back to earlier versions (with their settings).
 - **Plays in sync** with your DAW. **PREVIEW** lets you listen without the transport.
 - **Into your project:** drag the loop out as **WAV** or as **MIDI** (one note per slice), or export a WAV, a MIDI file, a **slice kit** (every slice as a WAV + the MIDI) or **stems** (one WAV per sample).
 - **Saved with your project,** including the samples themselves (embedded FLAC, up to 64 seconds per slot).
@@ -70,7 +68,7 @@ Without certificates the Mac build is ad-hoc signed and the Windows build is uns
 cmake -B build -G Xcode              # or: -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
-JUCE and Signalsmith Stretch are downloaded automatically. `.github/workflows/build.yml` builds the Mac version (universal: Apple Silicon + Intel) and the Windows version on every push, makes the installers and publishes them under Releases. Factory presets are generated with `python3 tools/make_presets.py`.
+JUCE and Signalsmith Stretch are downloaded automatically. `.github/workflows/build.yml` builds the Mac version (universal: Apple Silicon + Intel) and the Windows version on every push, makes the installers and publishes them under Releases. Factory presets are generated with `python3 tools/make_presets.py`. The manual in `docs/` is generated too: run the UI test once for fresh screenshots (`cd build && xvfb-run -a ./UITest_artefacts/Release/UITest`), then `python3 tools/make_manual.py` — that script is the manual's source, so change it whenever a control changes.
 
 ## Licenses
 

@@ -65,10 +65,10 @@ namespace
     bool settingsEqual (const Settings& a, const Settings& b)
     {
         return a.bars == b.bars && a.pattern == b.pattern && a.sliceMode == b.sliceMode && a.sliceSteps == b.sliceSteps
-            && a.sensitivity == b.sensitivity && a.chaos == b.chaos && a.motifBars == b.motifBars
+            && a.sensitivity == b.sensitivity && a.chaos == b.chaos && a.motifBars == b.motifBars && a.accent == b.accent
             && a.variation == b.variation && a.gate == b.gate && a.swing == b.swing && a.reverse == b.reverse
             && a.octave == b.octave && a.fadeMs == b.fadeMs && a.style == b.style && a.amount == b.amount && a.stretchMode == b.stretchMode && a.fillBars == b.fillBars
-            && a.energy == b.energy && a.feel == b.feel && a.fit == b.fit && a.fitProfile == b.fitProfile;
+            && a.energy == b.energy && a.fit == b.fit && a.fitProfile == b.fitProfile;
     }
 
     juce::uint64 randomSeed()
@@ -141,8 +141,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout SliceTribeProcessor::createL
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "trigger", 1 }, "New Loop", false,
                                                  AudioParameterBoolAttributes().withLabel ("trigger")));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "fill", 1 }, "Fill", choices::fills, 0));
-    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "feel", 1 }, "Time feel", choices::feels, 0));
     l.add (pct ("energy", "Energy", 0.0f));
+    // version hint 2: added after the first release, so it never shifts the order of the
+    // parameters that were already there (Logic remembers automation by position)
+    l.add (std::make_unique<AudioParameterFloat> (ParameterID { "accent", 2 }, "Accent",
+                                                  NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
+                                                  AudioParameterFloatAttributes().withLabel ("%")
+                                                      .withStringFromValueFunction ([] (float v, int) { return String (juce::roundToInt (v)) + "%"; })));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "midiMode", 1 }, "MIDI notes", choices::midiModes, 0));
     // finishing effects
     l.add (pct ("fxCutoff", "Cutoff", 100.0f));
@@ -224,7 +229,7 @@ Settings SliceTribeProcessor::readSettings() const
     s.stretchMode = juce::jlimit (0, 1, (int) get ("stretch"));
     s.fillBars    = choices::fillBars[juce::jlimit (0, 4, (int) get ("fill"))];
     s.energy      = get ("energy") / 100.0f;
-    s.feel        = juce::jlimit (0, 2, (int) get ("feel"));
+    s.accent      = get ("accent") / 100.0f;
     for (int tries = 0; tries < 4; ++tries)   // seqlock: never render half an old and half a new profile
     {
         const int v1 = fitVersion.load();
@@ -632,6 +637,7 @@ void SliceTribeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
     applyFx (buffer, res, blockStartIndex, step, numSamples);
     mixSlotPreview (buffer, rate, startPreviewNow);
+    limitOutput (buffer);
     playPosition = playIndex / len;
 }
 
@@ -1086,10 +1092,11 @@ void SliceTribeProcessor::run()
             }
 
             // STRAIGHT: pull a human recording onto the grid before anything else happens to it
+            const int slotStretch = st.stretchMode >= 0 ? juce::jlimit (0, 1, st.stretchMode) : s.stretchMode;
             if (st.warp > 0.001f)
             {
                 const double warpBpm = st.bpmOverride > 0.0 ? st.bpmOverride : a.detectedBpm;
-                const bool smoothWarp = s.stretchMode == stretchSmooth;
+                const bool smoothWarp = slotStretch == stretchSmooth;
                 auto& key = warpedKey[(size_t) i];
                 if (! key.done || key.loadId != a.loadId
                     || std::abs (key.bpm - warpBpm) > 1.0e-6 || std::abs (key.amount - st.warp) > 1.0e-6
@@ -1127,6 +1134,12 @@ void SliceTribeProcessor::run()
                 p.weight = st.weight;
                 changed = true;
             }
+            if (const float g = juce::Decibels::decibelsToGain (juce::jlimit (-24.0f, 24.0f, st.gainDb), -60.0f);
+                std::abs (p.gain - g) > 1.0e-6f)                // and neither does the level
+            {
+                p.gain = g;
+                changed = true;
+            }
             if (std::abs (p.trimStart - st.trimStart) > 1.0e-6f || std::abs (p.trimEnd - st.trimEnd) > 1.0e-6f)
             {
                 p.trimStart = st.trimStart;   // and neither do the two lines
@@ -1134,15 +1147,16 @@ void SliceTribeProcessor::run()
                 changed = true;
             }
 
-            // "time feel": half time = treat the sample as twice as fast, double time = twice as slow
-            const double feel = choices::feelFactor[juce::jlimit (0, 2, s.feel)];
-            const double baseBpm = st.bpmOverride > 0.0 ? st.bpmOverride : (a.detectedBpm > 0.0 ? a.detectedBpm : bpm);
-            const double srcBpm = baseBpm * feel;
+            const double srcBpm = st.bpmOverride > 0.0 ? st.bpmOverride
+                                                       : (a.detectedBpm > 0.0 ? a.detectedBpm : bpm);
             st.bpmOverride = srcBpm;
             const int effT = juce::jlimit (-24, 24, st.transpose + (keyTarget >= 0 ? engine::keyShift (a.detectedKey, keyTarget) : 0));
-            const bool need = p.loadId != a.loadId || p.rate != rate || p.transpose != effT || p.mode != s.stretchMode
+            // STRETCH is per sample: drums and bass want Beats, a vocal or a pad wants Smooth.
+            // A slot on "follow" uses the setting in the panel.
+            const int slotMode = slotStretch;
+            const bool need = p.loadId != a.loadId || p.rate != rate || p.transpose != effT || p.mode != slotMode
                            || std::abs (p.warp - st.warp) > 1.0e-6
-                           || (s.stretchMode == stretchSmooth && p.hostBpm != bpm)
+                           || (slotMode == stretchSmooth && p.hostBpm != bpm)
                            || std::abs (p.srcBpm - srcBpm) > 1.0e-6 || (wantOctave && ! p.withOctave);
 
             if (need)
@@ -1155,7 +1169,7 @@ void SliceTribeProcessor::run()
                 busy = true;
                 upToDate = false;
                 prepareInterrupt = abortWork.load();
-                auto np = engine::prepare (a, st, effT, bpm, rate, wantOctave, s.stretchMode, &prepareInterrupt);
+                auto np = engine::prepare (a, st, effT, bpm, rate, wantOctave, slotMode, &prepareInterrupt);
                 if (abortWork.load())
                     break;
                 if (prepareInterrupt.exchange (false))
@@ -1357,10 +1371,7 @@ void SliceTribeProcessor::runStems (const std::array<bool, kAllSlots>& enabled, 
         arr = arrangement;
     }
     const auto hits = engine::buildHits (rs, arr.seed);
-    // your own track is a reference under the loop, so it leaves room for it instead of adding
-    // a second full-scale signal on top (that would clip before you can judge anything)
-    const float ref = slotPreviewIndex.load() == kTrackSlot ? 0.6f : 1.0f;
-    const float gain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f) * ref;
+    const float gain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f);
     juce::String names;
     int written = 0;
     for (int i = 0; i < kNumSlots && ! abortWork.load() && ! threadShouldExit(); ++i)
@@ -1418,60 +1429,6 @@ void SliceTribeProcessor::autoPick (int candidates)
     wake.signal();
 }
 
-void SliceTribeProcessor::rerollRhythm()
-{
-    generateCount.fetch_add (1);
-    const auto now = currentParamValues();
-    {
-        const juce::ScopedLock al (arrangementLock);
-        history[(size_t) historyPos] = { arrangement, now };
-        history.resize ((size_t) historyPos + 1);
-        arrangement.regenerateRhythm (randomSeed());
-        history.push_back ({ arrangement, now });
-        if (history.size() > 200) history.erase (history.begin());
-        historyPos = (int) history.size() - 1;
-        historyPosAtomic = historyPos;
-        historySizeAtomic = (int) history.size();
-        keepLocksOnce = true;
-    }
-    activeScene = -1;
-    scenesVersion.fetch_add (1);
-    requestUpdate();
-}
-
-void SliceTribeProcessor::rerollSources()
-{
-    generateCount.fetch_add (1);
-    const auto now = currentParamValues();
-    {
-        const juce::ScopedLock al (arrangementLock);
-        history[(size_t) historyPos] = { arrangement, now };
-        history.resize ((size_t) historyPos + 1);
-        arrangement.regenerateSources (randomSeed());
-        history.push_back ({ arrangement, now });
-        if (history.size() > 200) history.erase (history.begin());
-        historyPos = (int) history.size() - 1;
-        historyPosAtomic = historyPos;
-        historySizeAtomic = (int) history.size();
-        lockedCount = arrangement.numLocked();
-        keepLocksOnce = true;
-    }
-    activeScene = -1;
-    scenesVersion.fetch_add (1);
-    requestUpdate();
-}
-
-int SliceTribeProcessor::keepToScene()
-{
-    for (int i = 0; i < numScenes; ++i)
-        if (! isSceneUsed (i))
-        {
-            storeScene (i);
-            return i;
-        }
-    return -1;
-}
-
 void SliceTribeProcessor::publishResult (std::shared_ptr<RenderResult> r)
 {
     {
@@ -1521,6 +1478,8 @@ SlotInfo SliceTribeProcessor::getSlotInfo (int i) const
     info.trimStart = st.trimStart;
     info.trimEnd = st.trimEnd;
     info.warp = st.warp;
+    info.gainDb = st.gainDb;
+    info.stretchMode = st.stretchMode;
     info.name = a.name.isNotEmpty() ? a.name
               : pending[(size_t) i].active ? pending[(size_t) i].file.getFileNameWithoutExtension()
               : missingFile[(size_t) i].getFileNameWithoutExtension();
@@ -1529,8 +1488,7 @@ SlotInfo SliceTribeProcessor::getSlotInfo (int i) const
     info.bpmOverride = st.bpmOverride;
     info.transpose = st.transpose;
     info.peaks = a.peaks;
-    const double feel = choices::feelFactor[juce::jlimit (0, 2, (int) apvts.getRawParameterValue ("feel")->load())];
-    const double src = (st.bpmOverride > 0 ? st.bpmOverride : a.detectedBpm) * feel;
+    const double src = st.bpmOverride > 0 ? st.bpmOverride : a.detectedBpm;
     info.stretchRatio = i == kTrackSlot ? 1.0                    // your own track is never stretched
                       : src > 0 ? getLoopBpm() / src : 1.0;
     return info;
@@ -1584,6 +1542,7 @@ void SliceTribeProcessor::setSlotPreview (int slot)
         slot = -1;                                  // clicking the playing slot again stops it
     std::shared_ptr<const juce::AudioBuffer<float>> audio;
     double fileRate = 44100.0, trackTempo = 0.0;
+    float slotGainDb = 0.0f;
     float trimA = 0.0f, trimB = 1.0f;
     int downbeat = -1;
     if (juce::isPositiveAndBelow (slot, kAllSlots))
@@ -1595,6 +1554,7 @@ void SliceTribeProcessor::setSlotPreview (int slot)
         trimA = slotState[(size_t) slot].trimStart;
         trimB = slotState[(size_t) slot].trimEnd;
         downbeat = slotAudio[(size_t) slot].downbeat;
+        slotGainDb = slotState[(size_t) slot].gainDb;
         trackTempo = slotState[(size_t) slot].bpmOverride > 0.0 ? slotState[(size_t) slot].bpmOverride
                                                                 : slotAudio[(size_t) slot].detectedBpm;
         if (audio == nullptr || audio->getNumSamples() < 2)
@@ -1650,6 +1610,7 @@ void SliceTribeProcessor::setSlotPreview (int slot)
     slotPreviewLoopA = loopA;
     slotPreviewLoopB = loopB;
     slotPreviewTempo = slot == kTrackSlot ? trackTempo : 0.0;   // your track runs at the loop's tempo
+    slotPreviewGain = slot >= 0 ? juce::Decibels::decibelsToGain (slotGainDb, -60.0f) : 1.0f;
     slotPreviewTrimStart = slot >= 0 ? trimA : 0.0f;
     slotPreviewTrimEnd   = slot >= 0 ? trimB : 1.0f;
     if (slot < 0)
@@ -1678,6 +1639,24 @@ void SliceTribeProcessor::setSlotPreview (int slot)
 }
 
 /** Plays the chosen sample on top of everything else, at its own tempo, looping. */
+/** A ceiling over everything that leaves the plug-in. Below -1 dB nothing is touched; above it
+    the peaks are rounded off, so a sample turned right up can never blast your monitors. */
+void SliceTribeProcessor::limitOutput (juce::AudioBuffer<float>& buffer) noexcept
+{
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+    {
+        float* d = buffer.getWritePointer (ch);
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const float x = d[i];
+            if (! std::isfinite (x))        { d[i] = 0.0f; continue; }
+            const float t = 0.89f;
+            if (x > t)       d[i] = t + (1.0f - t) * std::tanh ((x - t) / (1.0f - t));
+            else if (x < -t) d[i] = -(t + (1.0f - t) * std::tanh ((-x - t) / (1.0f - t)));
+        }
+    }
+}
+
 void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, double rate, bool restart)
 {
     const int numSamples = buffer.getNumSamples();
@@ -1730,7 +1709,12 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
     const float* inR = b.getReadPointer (b.getNumChannels() > 1 ? 1 : 0);
     float* outL = buffer.getWritePointer (0);
     float* outR = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
-    const float gain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f);
+    // your own track is a reference under the loop, so it leaves room for it instead of adding a
+    // second full-scale signal on top (that would clip before you can judge anything). Any other
+    // sample plays at the level you gave it, so what you hear is what it does in the loop.
+    const float ref = slotPreviewIndex.load() == kTrackSlot ? 0.6f : juce::jlimit (0.0f, 16.0f, slotPreviewGain.load());
+    const float wantGain = juce::Decibels::decibelsToGain (gainParam->load(), -100.0f) * ref;
+    const float gainStep = (float) (1.0 / juce::jmax (1.0, rate * 0.02));   // 20 ms to a new level
     const float ramp = (float) (1.0 / juce::jmax (1.0, rate * 0.004));   // 4 ms fade in / out
 
     for (int i = 0; i < numSamples; ++i)
@@ -1741,7 +1725,8 @@ void SliceTribeProcessor::mixSlotPreview (juce::AudioBuffer<float>& buffer, doub
         const int i0 = (int) juce::jlimit (0.0, (double) (len - 1), slotPlayPos);
         const int i1 = i0 + 1 < cutB ? i0 + 1 : cutA;
         const float f = (float) (slotPlayPos - i0);
-        const float g = slotPlayGain * gain;
+        slotPlayLevel += juce::jlimit (-gainStep * 16.0f, gainStep * 16.0f, wantGain - slotPlayLevel);
+        const float g = slotPlayGain * slotPlayLevel;
         outL[i] += (inL[i0] + (inL[i1] - inL[i0]) * f) * g;
         if (outR != nullptr)
             outR[i] += (inR[i0] + (inR[i1] - inR[i0]) * f) * g;
@@ -1805,6 +1790,31 @@ void SliceTribeProcessor::setSlotBpm (int slot, double bpm)
 void SliceTribeProcessor::setSlotTranspose (int slot, int semis)
 {
     { const juce::ScopedLock sl (slotLock); editSlotState (slot, [semis] (SlotState& st) { st.transpose = juce::jlimit (-12, 12, semis); }); }
+    slotsVersion.fetch_add (1);
+    requestUpdate();
+}
+
+/** Level of one sample, so a raw recording sits next to a mastered loop without re-normalising. */
+void SliceTribeProcessor::setSlotGain (int slot, float db)
+{
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
+        return;
+    const float v = juce::jlimit (-24.0f, 24.0f, db);
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [v] (SlotState& st) { st.gainDb = v; }); }
+    if (slotPreviewIndex.load() == slot)     // listening to it: follow the level straight away
+        slotPreviewGain = juce::Decibels::decibelsToGain (v, -60.0f);
+    slotsVersion.fetch_add (1);
+    requestUpdate();
+}
+
+/** STRETCH for one sample: -1 follows the panel, otherwise Beats or Smooth for this one only. */
+void SliceTribeProcessor::setSlotStretch (int slot, int mode)
+{
+    if (! juce::isPositiveAndBelow (slot, kAllSlots))
+        return;
+    const int m = mode < 0 ? -1 : juce::jlimit (0, 1, mode);
+    { const juce::ScopedLock sl (slotLock); editSlotState (slot, [m] (SlotState& st) { st.stretchMode = m; }); }
+    prepareInterrupt = true;
     slotsVersion.fetch_add (1);
     requestUpdate();
 }
@@ -2166,10 +2176,11 @@ void SliceTribeProcessor::applyParamValues (const ParamMap& values)
 
 /** Everything back to the factory position: the knobs, the FX and "back to normal".
     Used by CLEAR ALL, so you really start from scratch. */
-/** Every knob back to its default, without touching your samples or the preset you are on. */
+/** The CHARACTER | FX panel back to its default, without touching your samples, the preset you
+    are on, or what the loop is made of: rhythm, length, repeat, slicing and level stay yours. */
 void SliceTribeProcessor::knobsToNeutral()
 {
-    auto ids = presetParameterIds();
+    auto ids = neutralParameterIds();
     for (auto& id : ids)
         if (auto* prm = apvts.getParameter (id))
             if (std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-4f)
@@ -2202,6 +2213,11 @@ void SliceTribeProcessor::resetSettings()
 
 void SliceTribeProcessor::generateNew (const ParamMap* settingsBefore)
 {
+    // your choice under the button counts wherever a new loop comes from: the button, MIDI or
+    // an automated trigger
+    if (settingsBefore == nullptr && newLoopNeutral.load()
+        && juce::MessageManager::getInstance()->isThisTheMessageThread())
+        knobsToNeutral();
     if (settingsBefore == nullptr && crazyActive.exchange (false))
     {
         // The last loop came from the skin's crazy button: this NEW LOOP goes back to normal first -
@@ -2265,6 +2281,17 @@ void SliceTribeProcessor::mutate()
     activeScene = -1;
     scenesVersion.fetch_add (1);
     requestUpdate();
+}
+
+int SliceTribeProcessor::keepToScene()
+{
+    for (int i = 0; i < numScenes; ++i)
+        if (! isSceneUsed (i))
+        {
+            storeScene (i);
+            return i;
+        }
+    return -1;
 }
 
 void SliceTribeProcessor::historyBack()
@@ -2665,6 +2692,8 @@ void SliceTribeProcessor::getStateInformation (juce::MemoryBlock& dest)
             t.setProperty ("trimStart", st.trimStart, nullptr);
             t.setProperty ("trimEnd", st.trimEnd, nullptr);
             t.setProperty ("warp", st.warp, nullptr);
+            t.setProperty ("gainDb", st.gainDb, nullptr);
+            t.setProperty ("stretchMode", st.stretchMode, nullptr);
             if (detected > 0.0)
                 t.setProperty ("detectedBpm", detected, nullptr);
             // name and key travel with the project, also to a computer where the path doesn't exist
@@ -2774,6 +2803,17 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
             || params.getChild (i).hasType ("SCENES"))
             params.removeChild (i, nullptr);
     triggerWasOn = true;   // a stored "on" state of the trigger must not fire a new loop
+    // a parameter that did not exist yet when this project was saved goes back to its default
+    // instead of keeping whatever the instance happened to be on
+    for (auto& id : presetParameterIds())
+        if (auto* prm = apvts.getParameter (id))
+        {
+            bool present = false;
+            for (int i = 0; i < params.getNumChildren(); ++i)
+                present = present || params.getChild (i).getProperty ("id").toString() == id;
+            if (! present && std::abs (prm->getValue() - prm->getDefaultValue()) > 1.0e-6f)
+                prm->setValueNotifyingHost (prm->getDefaultValue());
+        }
     apvts.replaceState (params);
     triggerWasOn = apvts.getRawParameterValue ("trigger")->load() > 0.5f;
     presets.restoreFrom (root);
@@ -2817,6 +2857,8 @@ void SliceTribeProcessor::setStateInformation (const void* data, int size)
         st.trimStart = juce::jlimit (0.0f, 1.0f, (float) (double) t.getProperty ("trimStart", 0.0));
         st.trimEnd   = juce::jlimit (st.trimStart, 1.0f, (float) (double) t.getProperty ("trimEnd", 1.0));
         st.warp      = juce::jlimit (0.0f, 1.0f, (float) (double) t.getProperty ("warp", 0.0));
+        st.gainDb    = juce::jlimit (-24.0f, 24.0f, (float) (double) t.getProperty ("gainDb", 0.0));
+        st.stretchMode = juce::jlimit (-1, 1, (int) t.getProperty ("stretchMode", -1));
 
         const juce::MemoryBlock* emb = t.getProperty ("audio").getBinaryData();
         const auto path = t.getProperty ("path").toString();

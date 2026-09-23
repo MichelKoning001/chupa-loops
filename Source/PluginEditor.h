@@ -81,8 +81,8 @@ private:
     juce::OwnedArray<SlotComponent> slots;
     ResultView resultView;
 
-    ChoiceSelector patternSel, lengthSel, motifSel, modeSel, sizeSel, styleSel, stretchSel, fillSel, midiModeSel, feelSel;
-    Knob chaos, variation, gate, swing, amount, reverse, octave, fade, sensitivity, energy, volume;
+    ChoiceSelector patternSel, lengthSel, motifSel, modeSel, sizeSel, styleSel, stretchSel, fillSel, midiModeSel;
+    Knob chaos, variation, gate, swing, amount, reverse, octave, fade, sensitivity, energy, accent, volume;
     Knob fxCutoff, fxReso, fxEnv, fxDecay, fxLowCut, fxDrive, fxPump, fxWidth;
     PanelTabs charTabs { { "Character", "FX" } };
     juce::OwnedArray<SceneButton> sceneButtons;
@@ -93,7 +93,7 @@ private:
     CrazyButton crazyButton;
     juce::TextButton neutralButton;
     void refreshNeutralButton();
-    juce::TextButton mutateButton, rhythmButton, sourcesButton, autoPickButton, keepButton, backButton, forwardButton, exportButton, previewButton, unlockButton, spliceButton,
+    juce::TextButton mutateButton, autoPickButton, keepButton, backButton, forwardButton, exportButton, previewButton, unlockButton, spliceButton,
                      presetPrev, presetNext, presetSave, skinButton, aboutButton, clearAllButton;
     PresetNameBox presetName;
     DragOutTile dragOut, dragMidi;

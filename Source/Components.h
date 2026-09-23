@@ -149,8 +149,13 @@ public:
     void setValue (double v) { if (v != value) { value = v; repaint(); } }
     double getValue() const { return value; }
 
+    /** What a typed value means. Returns false when the text is not a value we accept
+        (empty, or a zero/negative number in a field that only goes up). */
+    static bool parseEntry (const juce::String& text, double minValue, double maxValue, double& out);
+
     double minValue = 0, maxValue = 1, pixelsPerStep = 6, step = 1;
     bool highlighted = false, allowTextEntry = false, locked = false;
+    bool resetOnRightClick = false;   // for fields whose double-click opens the text editor
     juce::String lockedTag;   // e.g. "SYNC" when the host sets the value
     std::function<juce::String (double)> format;
     std::function<void (double)> onChange, onDragEnd;
@@ -213,7 +218,7 @@ private:
     float trimA = 0.0f, trimB = 1.0f;             // what the UI shows while you drag
     double previewPos = -1.0;
 
-    DragNumber bpmField, transposeField, weightField, warpField;
+    DragNumber bpmField, transposeField, weightField, warpField, gainField, stretchField;
     juce::TextButton powerButton, clearButton, playButton;
     std::unique_ptr<juce::FileChooser> chooser;
 };

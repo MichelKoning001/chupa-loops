@@ -90,21 +90,7 @@ void Arrangement::regenerate (juce::uint64 newSeed)
     }
 }
 
-void Arrangement::regenerateRhythm (juce::uint64 newSeed)
-{
-    // buildHits uses the seed (Free / Random patterns and the motif); rhythmSeed decides the
-    // reverses, octaves and rolls. The per-hit seeds - and with them the sources - stay as they are.
-    seed = newSeed;
-    rhythmSeed = hashCombine (newSeed, 0x7A1Full);
-}
 
-void Arrangement::regenerateSources (juce::uint64 salt)
-{
-    // only new source seeds: forceOwn stays as it is, otherwise the motif repeat would be gone
-    for (size_t i = 0; i < hitSeeds.size(); ++i)
-        if (! locked[i])
-            hitSeeds[i] = hashCombine (hitSeeds[i], salt);
-}
 
 /** The stream a hit's reverses, octaves and rolls come from. A locked hit keeps the one it was
     locked on, so locking freezes exactly what you were hearing and nothing changes afterwards. */
@@ -1028,6 +1014,7 @@ PreparedSlot engine::prepare (const SlotAudio& a, const SlotState& state, int ef
     p.withOctave = withOctave;
     p.mode = mode;
     p.weight = juce::jlimit (0.0f, 2.0f, state.weight);
+    p.gain = juce::Decibels::decibelsToGain (juce::jlimit (-24.0f, 24.0f, state.gainDb), -60.0f);
     p.trimStart = juce::jlimit (0.0f, 1.0f, state.trimStart);
     p.trimEnd   = juce::jlimit (p.trimStart, 1.0f, state.trimEnd);
 
@@ -1385,6 +1372,7 @@ namespace
         int loopLen = 0, loopFade = 0;
         bool powerIn = false, powerOut = false;
         float slotRms = 0.0f;
+        float gain = 1.0f;                     // the sample's own level, times the accent
     };
 
     struct Alignment { int offset = 0; double best = 0.0, atZero = 0.0; };
@@ -1599,8 +1587,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         const double uSlot  = uniform (st);
         const double uChaos = uniform (st);
         const double uPos   = uniform (st);
-        // The "character" of a hit (reverse, octave, rolls) comes from its own stream, so a new rhythm
-        // keeps the sources. A locked hit uses its own seed for that too, so it never changes at all.
+        // The "character" of a hit (reverse, octave, rolls) comes from its own stream, separate
+        // from which sample it takes. A locked hit uses its own seed for that too, so it never changes at all.
         const juce::uint64 characterSeed = arr.characterSeedFor (h);
         juce::uint64 rt = hashCombine (seedToUse, characterSeed ^ 0x9E3779B97F4A7C15ull);
         const double uRev   = uniform (rt);
@@ -1782,8 +1770,11 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         // FIT TO TRACK: skip hits that land where your own track is already busy. The slice is
         // still worked out, and kept aside: if a sample would otherwise not be heard at all, one
         // of these comes back below.
+        // Whether FIT leaves room here does not depend on what you locked: locking freezes what
+        // you hear, and a slice FIT had already taken out stays out. Otherwise locking one slice
+        // would quietly rearrange the rest of the loop.
         bool fitSkip = false;
-        if (s.fit > 0.001f && ! isLocked && ! fitProtected[h] && ! inFill (hit))   // a fill always stays
+        if (s.fit > 0.001f && ! fitProtected[h] && ! inFill (hit))   // a fill always stays
         {
             const int step = ((int) std::floor (hit.startStep)) % 16;
             const float busy = s.fitProfile[(size_t) juce::jlimit (0, 15, step)];
@@ -1923,8 +1914,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
                             pool.push_back (k);
                     if (pool.empty())
                         continue;
-                    // hangs on the source seeds, not on the rhythm seed: RHY keeps the sources,
-                    // so the hand-over may not move when only the rhythm is re-rolled
+                    // hangs on the source seeds: the hand-over belongs with the sounds, so it
+                    // moves when the sources change and stays put when only the character does
                     juce::uint64 pk = hashCombine (0x51CEull, (juce::uint64) a2 + 1);
                     for (size_t q = 0; q < juce::jmin<size_t> (8, arr.hitSeeds.size()); ++q)
                         pk = hashCombine (pk, arr.hitSeeds[q]);
@@ -1958,7 +1949,9 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             float quietest = 2.0f;
             for (size_t k = 0; k < fitSkipped.size(); ++k)
             {
-                const int step = juce::jlimit (0, 15, (int) (fitSkipped[k].outStart / juce::jmax (1.0, stepLen)) % 16);
+                const size_t fh = (size_t) fitSkipped[k].hitIndex;
+                const int step = fh < hits.size() ? juce::jlimit (0, 15, ((int) std::floor (hits[fh].startStep) % 16 + 16) % 16)
+                                                  : juce::jlimit (0, 15, (int) (fitSkipped[k].outStart / juce::jmax (1.0, stepLen)) % 16);
                 const float busy = s.fitProfile[(size_t) step] + (fitSkipped[k].glitch ? 1.0f : 0.0f);
                 if (busy < quietest) { quietest = busy; pick = k; }
             }
@@ -1981,6 +1974,78 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
     // is looped (crossfaded), so notes sustain naturally and attacks are never doubled.
     const int hitFade = juce::jmax ((int) (0.0015 * rate), (int) (s.fadeMs * 0.001 * rate));
     const double guard = rate * 0.0015;
+    // ACCENT: the four beats of the bar stay where they are and everything in between steps
+    // back, so a roll breathes instead of rattling. Three things matter here:
+    //  - it hangs on the note's own place in the bar (un-swung), so SWING never changes a level;
+    //  - a note that slice size cut into pieces keeps one level for all of its pieces, otherwise
+    //    you would hear a staircase inside one note;
+    //  - the whole thing is scaled so the loop keeps its loudness: turning ACCENT up must sound
+    //    accented, not quieter.
+    // measured on a 1/32 grid, so slicing that fine still has a weakest step
+    auto weightOfStep = [] (double startStep)
+    {
+        const int s32 = (int) std::floor (startStep * 2.0 + 1.0e-6);
+        const int k = ((s32 % 32) + 32) % 32;
+        return k % 8 == 0 ? 1.0f          // the four beats of the bar, all equally strong
+             : k % 4 == 0 ? 0.75f         // the 1/8 in between
+             : k % 2 == 0 ? 0.55f         // the 1/16 in between that
+                          : 0.45f;        // and the 1/32
+    };
+    // One level per note. A note is worth what the strongest moment it covers is worth, so a
+    // note that starts just before a beat and runs over it is not demoted to an off-beat - and
+    // all the pieces slice size cut it into keep that same level, without a staircase inside.
+    std::vector<float> noteWeight (hits.size(), 1.0f);
+    if (s.accent > 0.001f)
+    {
+        for (size_t i = 0; i < hits.size(); ++i)
+            noteWeight[i] = weightOfStep (hits[i].startStep);
+        for (size_t i = 0; i < hits.size(); ++i)
+        {
+            if (hits[i].subIndex < 1)
+                continue;
+            size_t first = i;                            // walk back to the note's own start
+            while (first > 0 && hits[first].subIndex > 1 && hits[first - 1].subIndex == hits[first].subIndex - 1)
+                --first;
+            noteWeight[first] = juce::jmax (noteWeight[first], noteWeight[i]);
+        }
+        for (size_t i = 0; i < hits.size(); ++i)
+        {
+            if (hits[i].subIndex < 2)
+                continue;
+            size_t first = i;
+            while (first > 0 && hits[first].subIndex > 1 && hits[first - 1].subIndex == hits[first].subIndex - 1)
+                --first;
+            noteWeight[i] = noteWeight[first];
+        }
+    }
+    auto accentRaw = [&] (const Choice& c)
+    {
+        const size_t h2 = (size_t) c.hitIndex;
+        return h2 < noteWeight.size() ? noteWeight[h2] : 1.0f;
+    };
+    // scaled so the loop keeps its loudness, counting a long slice for more than a short one
+    // worked out over the rhythm itself, not over the slices that survived: that way locking a
+    // slice, or FIT leaving a hole, never quietly changes the level of the whole loop
+    float accentScale = 1.0f;
+    if (s.accent > 0.001f && ! hits.empty())
+    {
+        double mean = 0.0, total = 0.0;
+        for (size_t i = 0; i < hits.size(); ++i)
+        {
+            const double w = juce::jmax (0.25, hits[i].lenSteps);
+            mean += w * (1.0 + (double) s.accent * (noteWeight[i] - 1.0));
+            total += w;
+        }
+        mean = total > 0.0 ? mean / total : 1.0;
+        accentScale = mean > 1.0e-6 ? (float) (1.0 / mean) : 1.0f;
+    }
+    auto accentOf = [&] (const Choice& c)
+    {
+        if (s.accent <= 0.001f)
+            return 1.0f;
+        return (1.0f + s.accent * (accentRaw (c) - 1.0f)) * accentScale;
+    };
+
     std::vector<Piece> pieces;
     pieces.reserve (choicesOut.size() * 4);
 
@@ -2035,6 +2100,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         base.glitchDiv = c.glitchDiv;
         base.reversed = c.reversed;
         base.slotRms = ps.rms;
+        base.gain = ps.gain * accentOf (c);
 
         const bool warp = std::abs (ratio - 1.0) > 1.0e-4 && c.glitch == 0 && ! c.reversed;
         if (! warp)
@@ -2159,8 +2225,10 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         const bool internal = ! cur.hitStart;
 
 
-        // exact continuation of the same audio: no crossfade at all (bit-perfect)
-        if (&a == &b && std::abs (wrap ((juce::int64) std::llround (cont), a.getNumSamples())
+        // exact continuation of the same audio: no crossfade at all (bit-perfect). Only when both
+        // pieces play at the same level - a butt-join across a level step would be a click.
+        if (&a == &b && std::abs (prev.gain - cur.gain) < 1.0e-4f
+            && std::abs (wrap ((juce::int64) std::llround (cont), a.getNumSamples())
                                   - wrap ((juce::int64) std::llround (cur.srcStart), b.getNumSamples())) <= 1)
         {
             // butt-join exactly: no overlap, no gap (output positions may differ by a rounding sample)
@@ -2174,7 +2242,7 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
         }
 
         // an attack starts at full level exactly on its grid position: the previous piece fades out before it
-        if (cur.transientStart)
+        if (cur.transientStart)   // no overlap at all here, so a level step cannot click
         {
             const int pre = (int) juce::jmin<juce::int64> ((juce::int64) (rate * 0.002), prev.outLen / 3);
             prev.outLen -= pre;
@@ -2348,8 +2416,8 @@ std::shared_ptr<RenderResult> engine::render (const std::array<PreparedSlot, kAl
             float g0 = 1.0f, g1 = 1.0f;
             const float l = readAt (offset, 0, g0);
             const float r = readAt (offset, 1, g1);
-            outL[o] += l * env * g0;
-            outR[o] += r * env * g1;
+            outL[o] += l * env * g0 * p.gain;
+            outR[o] += r * env * g1 * p.gain;
         }
     }
 
@@ -2547,6 +2615,7 @@ double engine::scoreLoop (const RenderResult& r, double fillTargetScale)
     // 1. how much of the loop actually sounds (no long silences)
     const int win = juce::jmax (64, (int) (r.rate * 0.02));
     int windows = 0, loud = 0;
+    std::vector<double> levels;
     double sumSq = 0.0, peak = 0.0;
     for (int i = 0; i + win <= n; i += win)
     {
@@ -2559,12 +2628,17 @@ double engine::scoreLoop (const RenderResult& r, double fillTargetScale)
                 peak = juce::jmax (peak, std::abs (v));
             }
         const double rms = std::sqrt (e / win);
+        levels.push_back (rms);
         sumSq += e;
         ++windows;
-        loud += rms > 0.01 ? 1 : 0;   // > -40 dB
     }
     if (windows == 0 || peak < 1.0e-4)
         return 0.0;
+    // how full the loop is, measured against its own level: a loop where every sample is turned
+    // down is not an empty loop, it is a quiet one
+    const double loudLine = juce::jmax (0.0002, peak * 0.05);
+    for (double v : levels)
+        loud += v > loudLine ? 1 : 0;
     const double fill = (double) loud / windows;                       // 0..1
     const double rmsAll = std::sqrt (sumSq / juce::jmax (1, windows * win));
     const double crest = peak / juce::jmax (1.0e-6, rmsAll);           // punch

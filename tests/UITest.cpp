@@ -447,7 +447,7 @@ int main (int argc, char** argv)
         };
         waitFor (*proc, proc->getResultVersion());
 
-        // share per sample, energy, time feel, partial rerolls, KEEP, AUTO PICK and stems
+        // share per sample, energy, MUTATE, KEEP, AUTO PICK and stems
         {
             auto segmentsOfSlot = [] (const RenderResult& r, int slot)
             {
@@ -500,68 +500,7 @@ int main (int argc, char** argv)
             setParam ("energy", 0);
             waitFor (*proc, proc->getResultVersion() + 1);
 
-            // time feel: half time uses the samples at half speed
-            auto normal = proc->getDisplayResult();
-            setParam ("feel", 1);
-            CHECK (waitFor (*proc, proc->getResultVersion() + 1, 30000), "re-render in half time");
-            auto halfTime = proc->getDisplayResult();
-            CHECK (halfTime->settings.feel == 1 && halfTime->audio.getNumSamples() == normal->audio.getNumSamples()
-                   && ! same (halfTime.get(), normal.get()), "half time: same length, different sound");
-            setParam ("feel", 0);
-            waitFor (*proc, proc->getResultVersion() + 1, 30000);
-
-            // partial rerolls
-            setParam ("octave", 50); setParam ("reverse", 40);   // enough character to see it change
-            waitFor (*proc, proc->getResultVersion() + 1);
-            auto base = proc->getDisplayResult();
-            proc->rerollRhythm();
-            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "reroll rhythm renders");
-            auto rhy = proc->getDisplayResult();
-            bool sameSources = rhy->segments.size() == base->segments.size();
-            bool otherCharacter = false;
-            for (size_t i = 0; i < juce::jmin (rhy->segments.size(), base->segments.size()); ++i)
-            {
-                // the sample and the spot inside it stay; an octave slice reads from the resampled copy,
-                // so only compare srcStart when the octave flag is the same
-                sameSources &= rhy->segments[i].slot == base->segments[i].slot
-                            && (rhy->segments[i].octave != base->segments[i].octave || rhy->segments[i].srcStart == base->segments[i].srcStart);
-                otherCharacter |= rhy->segments[i].reversed != base->segments[i].reversed
-                                || rhy->segments[i].octave != base->segments[i].octave
-                                || rhy->segments[i].glitch != base->segments[i].glitch
-                                || rhy->segments[i].start != base->segments[i].start;
-            }
-            std::cout << "     RHY: sources kept " << (int) sameSources << ", character changed " << (int) otherCharacter << "\n";
-            CHECK (sameSources && otherCharacter, "RHY keeps the sources and changes the rhythm");
-            auto base2 = proc->getDisplayResult();
-            proc->rerollSources();
-            CHECK (waitFor (*proc, proc->getResultVersion() + 1), "reroll sources renders");
-            auto src = proc->getDisplayResult();
-            bool sameStarts = src->segments.size() == base2->segments.size();
-            bool otherSources = false;
-            for (size_t i = 0; i < juce::jmin (src->segments.size(), base2->segments.size()); ++i)
-            {
-                sameStarts &= src->segments[i].start == base2->segments[i].start;
-                otherSources |= src->segments[i].srcStart != base2->segments[i].srcStart || src->segments[i].slot != base2->segments[i].slot;
-            }
-            CHECK (sameStarts && otherSources, "SRC keeps the rhythm and changes the slices");
-            {
-                // RHY must still do something after SRC (forceOwn used to kill it)
-                auto base3 = proc->getDisplayResult();
-                proc->rerollRhythm();
-                waitFor (*proc, proc->getResultVersion() + 1);
-                auto rhy2 = proc->getDisplayResult();
-                int changed = 0;
-                for (size_t i = 0; i < juce::jmin (rhy2->segments.size(), base3->segments.size()); ++i)
-                    changed += rhy2->segments[i].reversed != base3->segments[i].reversed
-                            || rhy2->segments[i].octave != base3->segments[i].octave
-                            || rhy2->segments[i].glitch != base3->segments[i].glitch ? 1 : 0;
-                std::cout << "     RHY after SRC changed " << changed << " slices\n";
-                CHECK (changed > 0, "RHY still works after SRC");
-            }
-            setParam ("octave", 10); setParam ("reverse", 0);
-            waitFor (*proc, proc->getResultVersion() + 1);
-
-            // locked slices must survive a new rhythm and a new loop
+            // locked slices must survive a mutation and a new loop
             {
                 proc->toggleLock (1);
                 waitFor (*proc, proc->getResultVersion() + 1);
@@ -569,7 +508,7 @@ int main (int argc, char** argv)
                 int lockedSeg = -1;
                 for (size_t i = 0; i < locked->segments.size(); ++i)
                     if (locked->segments[i].locked) { lockedSeg = (int) i; break; }
-                proc->rerollRhythm();
+                proc->mutate();
                 waitFor (*proc, proc->getResultVersion() + 1);
                 auto after = proc->getDisplayResult();
                 bool kept = lockedSeg >= 0 && lockedSeg < (int) after->segments.size();
@@ -580,7 +519,7 @@ int main (int argc, char** argv)
                     kept = b1.locked && a1.slot == b1.slot && a1.srcStart == b1.srcStart
                         && a1.reversed == b1.reversed && a1.octave == b1.octave;
                 }
-                CHECK (kept, "a locked slice stays exactly the same after RHY");
+                CHECK (kept, "a locked slice stays exactly the same after MUTATE");
                 proc->generateNew();
                 waitFor (*proc, proc->getResultVersion() + 1);
                 auto after2 = proc->getDisplayResult();
@@ -718,54 +657,36 @@ int main (int argc, char** argv)
                 CHECK (proc->getReferenceSlot() == -1, "clearing the box ends FIT TO TRACK");
             }
 
-            // the motif repeat must survive SRC
+            // MUTATE, the one button that is left
             {
-                setParam ("motif", 1);      // 1 bar motif
-                setParam ("variation", 0);  // every repeat identical
+                // with the motif off, so one slice is one decision: with a motif on, re-rolling
+                // one slice also changes its repeats and the count says nothing
+                setParam ("motif", 0);
+                setParam ("variation", 0);
                 waitFor (*proc, proc->getResultVersion() + 1);
-                auto motifRepeats = [] (const RenderResult& r)
-                {
-                    const double bar = r.samplesPerBeat() * 4.0;
-                    int same = 0, pairs = 0;
-                    for (const auto& a2 : r.segments)
-                        if (a2.start < bar)
-                            for (const auto& b2 : r.segments)
-                                if (std::abs ((double) b2.start - ((double) a2.start + bar)) < 8.0)
-                                {
-                                    ++pairs;
-                                    same += (a2.slot == b2.slot && a2.srcStart == b2.srcStart) ? 1 : 0;
-                                }
-                    return pairs > 0 ? (double) same / pairs : 0.0;
-                };
-                // measured with two samples only: with more samples than slices in one repeat, a
-                // few slices are handed to a sample that would otherwise never be heard, and those
-                // are not part of the repeat - that would measure the hand-over, not the motif.
-                // and with VARIATION at 0: variation is meant to change slices in a repeat, so
-                // leaving it on would measure that instead of the motif.
-                for (int i2 = 2; i2 < kNumSlots; ++i2)
-                    proc->setSlotEnabled (i2, false);
-                const float varWas = proc->apvts.getParameter ("variation")->getValue();
-                setParam ("variation", 0.0f);
-                waitFor (*proc, proc->getResultVersion() + 1, 30000);
                 juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
-                const double before3 = motifRepeats (*proc->getDisplayResult());
-                proc->rerollSources();
+                // MUTATE is "again, but a bit different": a quarter of the slices gets another
+                // sound and the rest stays exactly as it was
+                auto shot2 = [] (const RenderResult& r)
+                {
+                    std::vector<juce::String> v;
+                    for (const auto& sg : r.segments)
+                        v.push_back (juce::String (sg.slot) + ":" + juce::String (sg.srcStart));
+                    return v;
+                };
+                const auto beforeMut = shot2 (*proc->getDisplayResult());
+                proc->mutate();
                 waitFor (*proc, proc->getResultVersion() + 1);
-                const double after3 = motifRepeats (*proc->getDisplayResult());
-                for (int i2 = 2; i2 < kNumSlots; ++i2)
-                    proc->setSlotEnabled (i2, true);
-                proc->apvts.getParameter ("variation")->setValueNotifyingHost (varWas);
-                waitFor (*proc, proc->getResultVersion() + 1, 30000);
-                std::cout << "     motif repeats: " << juce::String (before3 * 100, 0) << "% before SRC, "
-                          << juce::String (after3 * 100, 0) << "% after\n";
-                // with more samples loaded than there are slices in one repeat, a couple of slices
-                // carry a sample that would otherwise never be heard, so the repeat is not 100%.
-                // What matters here is that SRC does not make it any worse.
-                // With more samples loaded than there are slices in one repeat, a couple of slices
-                // are handed to a sample that would otherwise never be heard, and those are not
-                // part of the repeat - at most a third of the loop, so the repeat can never fall
-                // below about 70%. What this watches for is SRC pulling the motif apart.
-                CHECK (before3 > 0.99 && after3 > 0.99, "SRC keeps the motif repeat");
+                const auto afterMut = shot2 (*proc->getDisplayResult());
+                int movedMut = 0;
+                for (size_t i2 = 0; i2 < juce::jmin (beforeMut.size(), afterMut.size()); ++i2)
+                    movedMut += beforeMut[i2] != afterMut[i2] ? 1 : 0;
+                const double share = beforeMut.empty() ? 0.0 : (double) movedMut / beforeMut.size();
+                std::cout << "     MUTATE changed " << movedMut << " of " << beforeMut.size()
+                          << " slices (" << juce::String (share * 100, 0) << "%)\n";
+                CHECK (beforeMut.size() == afterMut.size() && share > 0.1 && share < 0.45,
+                       "MUTATE changes about a quarter of the slices and leaves the rest alone");
+                setParam ("motif", 2);
                 setParam ("motif", 2); setParam ("variation", 20);
                 waitFor (*proc, proc->getResultVersion() + 1);
             }
@@ -798,10 +719,17 @@ int main (int argc, char** argv)
                 CHECK (engine::scoreLoop (empty) == 0.0, "silence scores zero");
             }
 
-            // stems
+            // stems - with a sample being listened to at another level, which may not leak into
+            // the export (it once did)
             {
                 auto stemDir = out.getChildFile ("Stems");
                 stemDir.deleteRecursively();
+                proc->setSlotGain (1, -18.0f);
+                proc->setSlotPreview (1);
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+                proc->setSlotGain (1, 0.0f);
+                proc->setSlotPreview (1);
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
                 const int jv = proc->getJobVersion();
                 auto folder = proc->exportStems (stemDir);
                 const auto t0 = juce::Time::getMillisecondCounter();
@@ -1044,27 +972,44 @@ int main (int argc, char** argv)
             CHECK (block ({}).getMagnitude (0, 512) < 1.0e-6f, "Slices mode: silent without notes");
             // the engine may publish a new loop at any moment; compare against the loop that was
             // really playing, and try again if it was replaced half way through
-            double maxErr = 1.0, level = 0.0;
+            double maxErr = 1.0, level = 0.0, want = 0.0;
             juce::int64 segLen = 0;
             for (int attempt = 0; attempt < 5; ++attempt)
             {
                 const int v0 = proc->getResultVersion();
                 auto cur = proc->getDisplayResult();
-                const auto& seg = cur->segments[(size_t) cur->noteSegment[3]];   // the 4th different slice
+                // the first different slice that actually has sound in it: a silent slice would
+                // be played back correctly too, but there would be nothing to compare
+                int which = 3;
+                for (int k2 = 3; k2 < 12; ++k2)
+                {
+                    const int si = cur->noteSegment[(size_t) k2];
+                    if (si < 0 || si >= (int) cur->segments.size()) continue;
+                    const auto& sg2 = cur->segments[(size_t) si];
+                    if (cur->audio.getMagnitude (0, (int) sg2.start,
+                                                 juce::jmin ((int) sg2.length, cur->audio.getNumSamples() - (int) sg2.start)) > 0.01f)
+                    { which = k2; break; }
+                }
+                const auto& seg = cur->segments[(size_t) cur->noteSegment[(size_t) which]];
                 const int sn = juce::jlimit (512, 8192, (int) seg.length - 400);
-                auto first = block (note (37 + 3, true), sn);
-                block (note (37 + 3, false), 256);
+                auto first = block (note (37 + which, true), sn);
+                block (note (37 + which, false), 256);
                 if (proc->getResultVersion() != v0)
                     continue;                                  // a new loop landed: this reading is void
                 maxErr = 0.0;
                 for (int i = 200; i < sn; ++i)
                     maxErr = juce::jmax (maxErr, (double) std::abs (first.getSample (0, i) - cur->audio.getSample (0, (int) seg.start + i)));
                 level = first.getMagnitude (0, sn);
+                // what that slice sounds like in the loop: the note has to play the same thing,
+                // also when the slice itself happens to be a quiet one
+                want = cur->audio.getMagnitude (0, (int) seg.start, juce::jmin (sn, cur->audio.getNumSamples() - (int) seg.start));
                 segLen = seg.length;
                 break;
             }
-            std::cout << "     slice 4 on E1: max deviation " << maxErr << ", level " << level << ", slice length " << segLen << "\n";
-            CHECK (level > 0.01f && maxErr < 2.0e-3, "Slices mode: E1 (note 40) plays the 4th different slice exactly");
+            std::cout << "     a slice on its own key: max deviation " << maxErr << ", level " << level
+                      << " (in the loop " << want << "), slice length " << segLen << "\n";
+            CHECK (want > 1.0e-4 && level > want * 0.5 && maxErr < 2.0e-3,
+                   "Slices mode: a note plays exactly that one slice");
             block (note (40, false));
             float tail = 0.0f;
             for (int k = 0; k < 4; ++k) tail = block ({}).getMagnitude (0, 512);
@@ -1624,6 +1569,96 @@ int main (int argc, char** argv)
         CHECK (std::abs (p13->getHostBpm() - 174.0) < 0.01, "the tempo you set without a DAW comes back with the project");
     }
 
+    // ---- level per slot, STRETCH per slot, and both come back with the project --------------
+    {
+        auto pg = std::make_unique<SliceTribeProcessor>();
+        pg->prepareToPlay (48000.0, 512);
+        for (int i = 0; i < juce::jmin (3, files.size()); ++i)
+            pg->loadSlot (i, files[i]);
+        CHECK (waitFor (*pg, 1, 30000), "a loop to set levels on");
+
+        auto loopRms = [&] ()
+        {
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            auto r2 = pg->getDisplayResult();
+            double e = 0.0;
+            for (int i = 0; i < r2->audio.getNumSamples(); ++i)
+                e += (double) r2->audio.getSample (0, i) * r2->audio.getSample (0, i);
+            return std::sqrt (e / juce::jmax (1, r2->audio.getNumSamples()));
+        };
+        const double before4 = loopRms();
+        const int v4 = pg->getResultVersion();
+        for (int i = 0; i < 3; ++i)
+            pg->setSlotGain (i, -12.0f);
+        CHECK (waitFor (*pg, v4 + 1, 30000), "the loop is rebuilt when you change a sample's level");
+        const double after4 = loopRms();
+        std::cout << "     every sample at -12 dB: loop " << juce::String (before4, 4)
+                  << " -> " << juce::String (after4, 4) << "\n";
+        CHECK (after4 < before4 * 0.4 && after4 > before4 * 0.15, "every sample at -12 dB makes the loop about 12 dB quieter");
+
+        // listening to one sample uses the level you gave that sample
+        {
+            FakeHost fh2;
+            fh2.provideBpm = false;
+            pg->setPlayHead (&fh2);
+            pg->setSlotGain (0, 0.0f);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            pg->setSlotPreview (0);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            juce::AudioBuffer<float> loudPrev, quietPrev;
+            runHost (*pg, fh2, 0.6, &loudPrev);
+            pg->setSlotGain (0, -12.0f);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            runHost (*pg, fh2, 0.6, &quietPrev);
+            const float lp = loudPrev.getMagnitude (0, 0, loudPrev.getNumSamples());
+            const float qp = quietPrev.getMagnitude (0, 0, quietPrev.getNumSamples());
+            std::cout << "     listening to a sample at 0 dB vs -12 dB: " << juce::String (lp, 4)
+                      << " -> " << juce::String (qp, 4) << "\n";
+            CHECK (lp > 0.02f && qp < lp * 0.45f && qp > lp * 0.12f,
+                   "listening to a sample uses the level you gave it, live while you drag");
+            pg->setSlotPreview (0);
+            pg->setSlotGain (0, 0.0f);
+            pg->setPlayHead (nullptr);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        }
+
+        // STRETCH per slot: one sample on Smooth sounds different from one on Beats
+        for (int i = 0; i < 3; ++i)
+            pg->setSlotGain (i, 0.0f);
+        waitFor (*pg, pg->getResultVersion() + 1, 30000);
+        auto audioOf = [&] ()
+        {
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            return pg->getDisplayResult()->audio;
+        };
+        const int v5 = pg->getResultVersion();
+        auto beatsAll = audioOf();
+        pg->setSlotStretch (0, 1);                       // this one on Smooth, the rest follows the panel
+        CHECK (waitFor (*pg, v5 + 1, 30000), "the loop is rebuilt when you put one sample on Smooth");
+        auto oneSmooth = audioOf();
+        bool differs2 = beatsAll.getNumSamples() != oneSmooth.getNumSamples();
+        for (int i = 0; i < oneSmooth.getNumSamples() && ! differs2; i += 7)
+            differs2 = std::abs (oneSmooth.getSample (0, i) - beatsAll.getSample (0, i)) > 1.0e-4f;
+        CHECK (differs2, "STRETCH on one sample only really changes that sample");
+        CHECK (pg->getSlotInfo (0).stretchMode == 1 && pg->getSlotInfo (1).stretchMode == -1,
+               "and the other samples keep following the panel");
+
+        // both come back with the project
+        pg->setSlotGain (1, -7.5f);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        juce::MemoryBlock stg;
+        pg->getStateInformation (stg);
+        auto pg2 = std::make_unique<SliceTribeProcessor>();
+        pg2->prepareToPlay (48000.0, 512);
+        pg2->setStateInformation (stg.getData(), (int) stg.getSize());
+        for (int t = 0; t < 200 && ! pg2->getSlotInfo (1).loaded; ++t)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        CHECK (std::abs (pg2->getSlotInfo (1).gainDb + 7.5f) < 0.01f && pg2->getSlotInfo (0).stretchMode == 1,
+               "the level and the stretch mode of a sample come back with the project");
+        pg2->releaseResources();
+        pg->releaseResources();
+    }
+
     // ---- MY TRACK and the loop play together, on the beat, and stay together ----------------
     {
         const double rate = 48000.0, tBpm = 140.0;
@@ -1840,6 +1875,23 @@ int main (int argc, char** argv)
                 peak = juce::jmax (peak, hot.getMagnitude (c, 0, hot.getNumSamples()));
             std::cout << "     everything driven to the max: peak " << juce::String (peak, 3) << "\n";
             CHECK (peak <= 1.02f, "resonance + drive + volume all the way up still does not go over full scale");
+
+            // and a sample turned right up while you listen to it cannot blast the output either
+            set ("gain", 12.0f);
+            pf->setSlotGain (0, 24.0f);
+            pf->setSlotPreview (0);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            juce::AudioBuffer<float> blast;
+            play (blast);
+            float bp = 0.0f;
+            for (int c = 0; c < blast.getNumChannels(); ++c)
+                bp = juce::jmax (bp, blast.getMagnitude (c, 0, blast.getNumSamples()));
+            std::cout << "     a sample at +24 dB with the output at +12 dB: peak " << juce::String (bp, 3) << "\n";
+            CHECK (bp <= 1.02f, "a sample turned right up never goes over full scale either");
+            pf->setSlotPreview (0);
+            pf->setSlotGain (0, 0.0f);
+            set ("gain", 0.0f);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
             set ("fxCutoff", 100.0f); set ("fxReso", 0.0f); set ("fxDrive", 0.0f); set ("gain", 0.0f);
         }
 
@@ -1905,7 +1957,7 @@ int main (int argc, char** argv)
             waitFor (*pf, pf->getResultVersion() + 1, 30000);
         }
 
-        // STRETCH and TIME FEEL are done when a sample is prepared, so they show up in the loop
+        // STRETCH is done when a sample is prepared, so it shows up in the loop
         auto loopAudio = [&] ()
         {
             juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
@@ -1922,20 +1974,85 @@ int main (int argc, char** argv)
             set ("stretch", 0);
             waitFor (*pf, pf->getResultVersion() + 1, 30000);
         }
-        for (int fe = 1; fe <= 2; ++fe)
-        {
-            const int v0 = pf->getResultVersion();
-            auto normal = loopAudio();
-            set ("feel", (float) fe);
-            waitFor (*pf, v0 + 1, 30000);
-            auto changed = loopAudio();
-            CHECK (differs (normal, changed),
-                   juce::String ("TIME FEEL ") + (fe == 1 ? "half time" : "double time") + " changes the loop");
-            set ("feel", 0.0f);
-            waitFor (*pf, pf->getResultVersion() + 1, 30000);
-        }
         pf->setPlayHead (nullptr);
         pf->releaseResources();
+    }
+
+    // ---- NEW LOOP: ALL NEUTRAL resets the CHARACTER | FX panel and nothing else
+    {
+        std::cout << "\n== ALL NEUTRAL ==\n";
+        auto put = [&] (const char* id, float value)
+        {
+            auto* prm = proc->apvts.getParameter (id);
+            prm->setValueNotifyingHost (prm->convertTo0to1 (value));
+        };
+        auto get = [&] (const char* id) { return proc->apvts.getParameter (id)->getValue(); };
+
+        put ("pattern", 5);        // Rolling KBBB
+        put ("length", 4);         // 16 bars
+        put ("sliceSize", 0);      // 1/32
+        put ("motif", 2);
+        put ("stretch", 1);
+        put ("gain", -6.0f);
+        put ("chaos", 0.8f);
+        put ("accent", 0.7f);
+        put ("fxDrive", 0.6f);
+        put ("fill", 2);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+
+        const float patternBefore = get ("pattern"), lengthBefore = get ("length");
+        const float sizeBefore = get ("sliceSize"), motifBefore = get ("motif");
+        const float stretchBefore = get ("stretch"), gainBefore = get ("gain");
+        const float fillBefore = get ("fill");
+
+        proc->knobsToNeutral();
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+
+        auto isDefault = [&] (const char* id)
+        {
+            auto* prm = proc->apvts.getParameter (id);
+            return std::abs (prm->getValue() - prm->getDefaultValue()) < 1.0e-4f;
+        };
+        CHECK (isDefault ("chaos") && isDefault ("accent") && isDefault ("fxDrive"),
+               "ALL NEUTRAL puts the character and FX knobs back");
+        CHECK (get ("pattern") == patternBefore && get ("length") == lengthBefore
+                   && get ("sliceSize") == sizeBefore && get ("motif") == motifBefore
+                   && get ("stretch") == stretchBefore,
+               "ALL NEUTRAL leaves your rhythm, length, repeat, slice size and stretch alone");
+        CHECK (get ("gain") == gainBefore, "ALL NEUTRAL leaves your output level alone");
+        CHECK (get ("fill") == fillBefore, "ALL NEUTRAL leaves your FILL alone");
+
+        proc->resetSettings();     // CLEAR ALL really does put everything back
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+        CHECK (isDefault ("pattern") && isDefault ("length") && isDefault ("sliceSize")
+                   && isDefault ("fill") && isDefault ("key"),
+               "CLEAR ALL puts the settings and the key back to Init");
+    }
+
+    // ---- typing in a number field: the slot level goes below zero, the tempo does not
+    {
+        std::cout << "\n== TYPED VALUES ==\n";
+        double v = 999.0;
+        CHECK (DragNumber::parseEntry ("-6", -24.0, 24.0, v) && std::abs (v + 6.0) < 1.0e-9,
+               "you can type a negative level (-6 dB)");
+        v = 999.0;
+        CHECK (DragNumber::parseEntry ("0", -24.0, 24.0, v) && std::abs (v) < 1.0e-9,
+               "you can type 0 dB");
+        v = 999.0;
+        CHECK (DragNumber::parseEntry ("-40", -24.0, 24.0, v) && std::abs (v + 24.0) < 1.0e-9,
+               "a level below the range stops at -24 dB");
+        v = 999.0;
+        CHECK (DragNumber::parseEntry ("+3,5", -24.0, 24.0, v) && std::abs (v - 3.5) < 1.0e-9,
+               "a comma works as a decimal point");
+        v = 128.0;
+        CHECK (! DragNumber::parseEntry ("0", 40.0, 300.0, v) && v == 128.0,
+               "typing 0 in the tempo field keeps the tempo it had");
+        CHECK (! DragNumber::parseEntry ("", 40.0, 300.0, v) && v == 128.0,
+               "an empty entry keeps the value it had");
+        CHECK (! DragNumber::parseEntry ("abc", -24.0, 24.0, v) && v == 128.0,
+               "text with no number keeps the value it had");
+        CHECK (DragNumber::parseEntry ("140", 40.0, 300.0, v) && std::abs (v - 140.0) < 1.0e-9,
+               "typing a tempo still works");
     }
 
     writeSetting ("tourDone", tourSetting);

@@ -23,6 +23,8 @@ struct SlotInfo
     float weight = 1.0f;
     float trimStart = 0.0f, trimEnd = 1.0f;
     float warp = 0.0f;
+    float gainDb = 0.0f;
+    int stretchMode = -1;      // -1 = follows the panel
     bool reference = false;
     double stretchRatio = 1.0;
     std::vector<float> peaks;
@@ -87,6 +89,10 @@ public:
     void clearSlot (int slot);
     void setSlotEnabled (int slot, bool);
     void setSlotWeight (int slot, float weight);       // 0..2: share of the slices coming from this sample
+    /** Level of this sample in the loop, -24..+24 dB. */
+    void setSlotGain (int slot, float db);
+    /** STRETCH for this sample only: -1 = follow the panel, 0 = Beats, 1 = Smooth. */
+    void setSlotStretch (int slot, int mode);
     /** The two lines on a slot: slices are only taken from between them (0..1 of the sample). */
     void setSlotTrim (int slot, float start, float end);
     /** Pulls a human recording onto the grid: 0 = as recorded, 1 = dead straight. */
@@ -108,8 +114,6 @@ public:
     void knobsToNeutral();                   // every knob back to its default, samples untouched
     void crazyLoop (int flavour);   // the skin's "craziest loop ever" (flavour = skin index)
     void mutate();                  // a variation: 20-30% of the unlocked slices change
-    void rerollRhythm();            // new rhythm, same sources
-    void rerollSources();           // same rhythm, other slices
     void autoPick (int candidates = 8);   // makes a few loops and keeps the one that scores best
     int  keepToScene();             // stores the loop in the first free scene, -1 = all full
     juce::File exportStems (const juce::File& parentFolder);   // one WAV per sample (asks the worker)
@@ -353,6 +357,7 @@ private:
 
     // listening to a single slot (its own tempo, looping): published by the message thread
     void mixSlotPreview (juce::AudioBuffer<float>&, double rate, bool restart);
+    void limitOutput (juce::AudioBuffer<float>&) noexcept;   // a ceiling over everything we send out
     mutable juce::SpinLock slotPreviewLock;
     std::shared_ptr<const juce::AudioBuffer<float>> slotPreviewAudio;   // guarded by slotPreviewLock
     std::atomic<double> slotPreviewRate { 44100.0 };
@@ -360,6 +365,7 @@ private:
     // your own track plays along with the loop: a whole number of bars, from its own bar one
     std::atomic<int> slotPreviewLoopA { -1 }, slotPreviewLoopB { -1 };
     std::atomic<double> slotPreviewTempo { 0.0 };   // the played sample's own tempo (0 = play as it is)
+    std::atomic<float> slotPreviewGain { 1.0f };    // and at the level you gave that sample
     /** Goes up every time listening has to start on the one again. The audio thread reads it once
         per block, so your own track and the loop always start in the very same block. */
     std::atomic<int> previewStartVersion { 0 };
@@ -369,7 +375,7 @@ private:
     std::shared_ptr<const juce::AudioBuffer<float>> slotPlaying;        // audio thread
     double slotPlayPos = 0.0, slotPlayStep = 1.0;
     double trackFollowPos = -1.0;   // audio thread: where the DAW says your own track should be
-    float slotPlayGain = 0.0f;
+    float slotPlayGain = 0.0f, slotPlayLevel = 0.0f;   // level of the sample being listened to, smoothed
     int slotPlayVersion = -1;
 
     juce::Array<juce::AudioProcessorParameter*> allParams;
